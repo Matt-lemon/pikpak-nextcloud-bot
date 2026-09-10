@@ -3,6 +3,7 @@ import logging
 from pathlib import Path
 import os
 import time
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,16 @@ class TorrentDownloader:
                 pass
         
         options = {"dir": str(self.download_dir)}
+        # ROUND-4 FIX: 쿼리스트링/fragment가 붙은 .torrent URL도 안전 경로로.
+        # - 기존: 전체 문자열 endswith('.torrent') -> '?token=abc'가 붙으면 False가
+        #   되어 else:add_uris()로 떨어져 aria2가 직접 fetch (redirect SSRF 회귀).
+        # - 수정: LinkDetector와 동일하게 URL path 기준으로 판정.
+        _is_http = magnet_or_url.startswith(('http://', 'https://'))
+        try:
+            _url_path = urlparse(magnet_or_url).path.lower() if _is_http else ""
+        except Exception:
+            _url_path = ""
+        is_remote_torrent = _is_http and _url_path.endswith('.torrent')
         try:
             maybe_path = Path(magnet_or_url)
             if maybe_path.exists() and maybe_path.is_file() and maybe_path.suffix.lower() == '.torrent':
@@ -69,7 +80,7 @@ class TorrentDownloader:
                 download = self.client.add_torrent(str(maybe_path), options=options)
             elif magnet_or_url.startswith("magnet:"):
                 download = self.client.add_magnet(magnet_or_url, options=options)
-            elif magnet_or_url.lower().endswith('.torrent') and magnet_or_url.startswith(('http://', 'https://')):
+            elif is_remote_torrent:
                 # ROUND-3 FIX: 원격 .torrent URL을 aria2에 직접 주지 않음.
                 # - 이유: aria2가 redirect를 자체 처리하므로 Python SSRF 검사가
                 #   첫 hop만 보고 우회됨 (302 -> 내부 IP 가능).

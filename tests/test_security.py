@@ -110,6 +110,12 @@ class TestDetector:
         assert LinkDetector.detect("https://m.youtube.com/watch?v=1")["type"] == "ytdlp"
         assert LinkDetector.detect("magnet:?xt=urn:btih:ABC")["type"] == "magnet"
 
+    def test_torrent_url_with_query_and_fragment(self):
+        # ROUND-4 회귀: 쿼리/fragment가 붙어도 torrent_url로 판정되어야 함
+        assert LinkDetector.detect("https://example.com/file.torrent?token=123")["type"] == "torrent_url"
+        assert LinkDetector.detect("https://example.com/file.torrent#frag")["type"] == "torrent_url"
+        assert LinkDetector.detect("https://example.com/file.torrent")["type"] == "torrent_url"
+
 
 class TestSharePermissions:
     def test_wired(self):
@@ -120,6 +126,72 @@ class TestSharePermissions:
         assert NextcloudClient("https://nc.example", "u", "p", share_permissions=99).share_permissions == 1
         assert NextcloudClient("https://nc.example", "u", "p", share_permissions="x").share_permissions == 1
         assert NextcloudClient("https://nc.example", "u", "p").share_permissions == 1
+
+
+class TestTorrentRouting:
+    """ROUND-4 회귀: 쿼리/fragment가 붙은 .torrent URL이 aria2 직접 fetch(add_uris)로
+    빠지지 않고, HttpDownloader -> 로컬 add_torrent() 안전 경로를 타는지 mock 검증."""
+
+    def _make_downloader(self, tmpdir):
+        from bot.downloaders import torrent_downloader as td_mod
+        # __init__ 우회 (__new__): aria2p 없이 client만 주입
+        dl = td_mod.TorrentDownloader.__new__(td_mod.TorrentDownloader)
+        dl.download_dir = Path(tmpdir)
+        dl.aria2_host = "http://aria2:6800"
+        dl.aria2_secret = ""
+        dl.max_file_size = 1024 ** 3
+        return dl
+
+    def _run_download(self, url):
+        import asyncio
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        with tempfile.TemporaryDirectory() as tmp:
+            # 가짜 .torrent (bencode 매직 'd') + 가짜 콘텐츠
+            tf = Path(tmp) / "x.torrent"
+            tf.write_bytes(b"d8:announce4:teste")
+            content = Path(tmp) / "content.bin"
+            content.write_bytes(b"0123456789")
+
+            fake_file = MagicMock()
+            fake_file.path = str(content)
+            fake_file.length = 10
+            aria_dl = MagicMock()
+            aria_dl.gid = "gid123"
+            aria_dl.status = "complete"
+            aria_dl.completed_length = 10
+            aria_dl.total_length = 10
+            aria_dl.files = [fake_file]
+            aria_dl.dir = tmp
+            aria_dl.name = "content.bin"
+            aria_dl.download_speed = 0
+
+            fake_client = MagicMock()
+            fake_client.add_torrent.return_value = aria_dl
+
+            async def _fake_http_download(url_, max_file_size=None):
+                assert url_ == url
+                return tf
+
+            fake_http_instance = MagicMock()
+            fake_http_instance.download = _fake_http_download
+            fake_http_cls = MagicMock(return_value=fake_http_instance)
+
+            downloader = self._make_downloader(tmp)
+            downloader.client = fake_client
+            with patch("bot.downloaders.http_downloader.HttpDownloader", fake_http_cls), \
+                 patch("bot.downloaders.http_downloader.is_safe_url", return_value=(True, "")):
+                result = asyncio.run(downloader.download(url))
+
+            assert result == content
+            fake_client.add_torrent.assert_called_once()
+            fake_client.add_uris.assert_not_called()
+
+    def test_query_url_uses_safe_path(self):
+        self._run_download("https://example.com/file.torrent?token=123")
+
+    def test_fragment_url_uses_safe_path(self):
+        self._run_download("https://example.com/file.torrent#frag")
 
 
 class TestPTBStreaming:

@@ -215,6 +215,44 @@ class TestCleanupEmptyDirs:
         cleanup_empty_dirs(c, "PikPakBot")
         assert f"PikPakBot/{today}" not in c.deleted
 
+    def test_past_date_tree_cleans_inner_empty_subfolder(self):
+        # 과거 날짜 폴더 안의 빈 보조 폴더(forwarded)는 mtime이 최근이어도 함께 삭제
+        past = (datetime.now().astimezone().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(past, True, "")],
+            f"PikPakBot/{past}": [_entry("forwarded", True, FRESH)],
+            f"PikPakBot/{past}/forwarded": [],
+        }
+        c = FakeClient(tree)
+        cleanup_empty_dirs(c, "PikPakBot")
+        assert f"PikPakBot/{past}/forwarded" in c.deleted
+        assert f"PikPakBot/{past}" in c.deleted
+
+    def test_past_date_tree_with_file_preserved(self):
+        # 만료된 날짜 트리라도 파일이 하나라도 있으면 보존
+        past = (datetime.now().astimezone().date() - timedelta(days=1)).strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(past, True, "")],
+            f"PikPakBot/{past}": [_entry("forwarded", True, FRESH)],
+            f"PikPakBot/{past}/forwarded": [_entry("movie.mp4", False, OLD)],
+        }
+        c = FakeClient(tree)
+        cleanup_empty_dirs(c, "PikPakBot")
+        assert c.deleted == []
+
+    def test_today_date_folder_inner_subfolder_not_expired(self):
+        # 오늘 날짜 폴더 안의 빈 forwarded는 만료 트리가 아니므로 mtime 보호 유지
+        today = datetime.now().astimezone().date().strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(today, True, "")],
+            f"PikPakBot/{today}": [_entry("forwarded", True, FRESH)],
+            f"PikPakBot/{today}/forwarded": [],
+        }
+        c = FakeClient(tree)
+        stats = cleanup_empty_dirs(c, "PikPakBot")
+        assert c.deleted == []
+        assert stats["protected"] == 1  # forwarded가 mtime 보호로 남음
+
 
 class TestAgeOk:
     def test_old(self):

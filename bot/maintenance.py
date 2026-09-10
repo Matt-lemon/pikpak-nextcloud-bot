@@ -6,6 +6,8 @@
 - 삭제 규칙 (빈 폴더일 때):
   - 정확히 YYYY-MM-DD 형식의 날짜 폴더: 달력 날짜 기준
     오늘/미래는 보호, 지난 날짜는 수정시각과 무관하게 삭제
+  - 지난 날짜 폴더의 빈 하위 폴더(예: forwarded/): '만료된 날짜 트리'로
+    간주해 mtime과 무관하게 함께 정리 (단, 파일이 하나라도 있으면 보존)
   - 그 외 폴더: min_age_hours보다 오래됐을 때만 삭제,
     수정시각이 없거나 깨졌으면 보존 (fail-closed)
 - base_path가 비어 있으면 거부 (루트 오삭제 방지)
@@ -79,7 +81,8 @@ def cleanup_empty_dirs(nc_client, base_path: str, min_age_hours: int = 24,
         # 빈 base로 재귀하면 Nextcloud 루트 전체가 탐색 대상이 됨 (오삭제 위험)
         raise ValueError("cleanup에는 비어 있지 않은 NEXTCLOUD_BASE_PATH가 필요합니다")
 
-    def _clean(remote: str, depth: int, modified: str = "") -> bool:
+    def _clean(remote: str, depth: int, modified: str = "",
+               expired_date_tree: bool = False) -> bool:
         """True=폴더 유지됨, False=삭제됨."""
         if depth > max_depth:
             return True  # 깊이 초과: 손대지 않음
@@ -90,27 +93,31 @@ def cleanup_empty_dirs(nc_client, base_path: str, min_age_hours: int = 24,
             return True
         stats["scanned"] += 1
         has_files = any(not e["is_dir"] for e in entries)
+        # 이 폴더와 그 하위가 '만료된 날짜 트리'에 속하는지:
+        # 자기 자신이 과거 날짜 폴더이거나, 부모가 이미 만료된 날짜 트리면
+        # 그 안의 빈 하위 폴더는 mtime과 무관하게 정리 대상.
+        name = remote.rsplit("/", 1)[-1]
+        date_status = _date_folder_status(name)
+        this_expired_tree = expired_date_tree or date_status == "past"
         child_remains = False
         # 파일이 있어도 하위 폴더는 계속 탐색해야 함 (mixed tree)
         for e in entries:
             if not e["is_dir"]:
                 continue
             child = f"{remote}/{e['name']}".strip("/")
-            if _clean(child, depth + 1, e.get("modified", "")):
+            if _clean(child, depth + 1, e.get("modified", ""), this_expired_tree):
                 child_remains = True
         if depth == 0:
             return True  # base 자체는 절대 삭제 안 함
         if has_files or child_remains:
             return True  # 파일이 있거나 살아남은 하위 폴더가 있으면 유지
-        name = remote.rsplit("/", 1)[-1]
-        date_status = _date_folder_status(name)
-        if date_status == "past":
-            pass  # 지난 날짜의 빈 YYYY-MM-DD 폴더: 수정시각과 무관하게 삭제
-        elif date_status in ("today", "future"):
+        if date_status in ("today", "future"):
             stats["protected"] += 1  # 오늘/미래 날짜 폴더는 절대 삭제 안 함
             return True
+        if this_expired_tree:
+            pass  # 만료된 날짜 트리 내부의 빈 폴더: mtime 무시하고 삭제
         elif not _age_ok(modified, min_age):
-            stats["protected"] += 1  # 날짜 폴더가 아니면 mtime/연령 보호
+            stats["protected"] += 1  # 일반 폴더: mtime/연령 보호
             return True
         # 삭제 직전 재확인 (이 사이 업로드 시작 레이스 방지)
         try:

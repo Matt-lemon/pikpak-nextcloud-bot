@@ -11,7 +11,7 @@ from telegram.constants import ParseMode
 from .downloaders import LinkDetector, HttpDownloader, TorrentDownloader, YtDlpDownloader
 from .nextcloud import NextcloudClient
 from .queue_manager import QueueManager, DownloadTask
-from .utils import format_size, format_speed, progress_bar, get_files_recursive, sanitize_filename, safe_join
+from .utils import format_size, format_speed, progress_bar, get_files_recursive, sanitize_filename, safe_join, truncate_lines
 from .utils.file_splitter import CHUNK_SIZE as SPLIT_CHUNK_SIZE
 
 # 대용량 파일 분할 전송 통합 (선택적)
@@ -431,7 +431,9 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entries = await loop.run_in_executor(None, lambda: nc_client.list_dir(remote))
 
         max_entries = 30
-        lines = [f"📁 `{_code('/' + remote + '/')}` ({len(entries)}개)"]
+        # ROUND-7: 헤더 경로 표시 상한 (초장 경로가 텔레그램 4096자 제한 초과 방지)
+        disp_remote = remote if len(remote) <= 200 else remote[:200] + "..."
+        lines = [f"📁 `{_code('/' + disp_remote + '/')}` ({len(entries)}개)"]
         if not entries:
             lines.append("(비어 있음)")
         for e in entries[:max_entries]:
@@ -443,9 +445,8 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 lines.append(f"{icon} `{_code(disp)}`")
         if len(entries) > max_entries:
             lines.append(f"외 {len(entries) - max_entries}개 더 있음")
-        text = "\n".join(lines)
-        if len(text) > 3500:
-            text = text[:3500] + "\n...(길이 제한으로 잘림)"
+        # ROUND-7: 줄 단위 절단 (문자열 강제 절단은 코드스팬 파괴)
+        text = truncate_lines(lines)
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ 목록 조회 실패: {str(e)[:300]}")
@@ -471,7 +472,7 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             logger.warning(f"⛔ SECURITY: /merge 외부 경로 차단: {' '.join(context.args)} (사용자: {update.effective_user.id})")
             await update.message.reply_text(
-                f"⛔ **보안 차단**\n다운로드 폴더(`{download_dir}`) 내부 경로만 지정할 수 있습니다.",
+                f"⛔ **보안 차단**\n다운로드 폴더(`{_code(download_dir)}`) 내부 경로만 지정할 수 있습니다.",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -505,11 +506,11 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # manifest 기반 복원
         for manifest_path in manifests:
             try:
-                await update.message.reply_text(f"🔨 복원 중: `{manifest_path.name}`", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"🔨 복원 중: `{_code(manifest_path.name)}`", parse_mode=ParseMode.MARKDOWN)
                 loop = asyncio.get_event_loop()
                 restored = await loop.run_in_executor(None, lambda mp=manifest_path, td=target_dir: restore_file(manifest_path=mp, chunks_dir=td, output_path=None, verify=True))
                 restored_files.append(restored)
-                text += f"✅ 복원 완료: `{restored.name}` ({format_size(restored.stat().st_size)})\n"
+                text += f"✅ 복원 완료: `{_code(restored.name)}` ({format_size(restored.stat().st_size)})\n"
                 
                 # Nextcloud 업로드 - config에 따라 공유 링크 생성 여부 결정
                 try:
@@ -521,12 +522,12 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         share_url = await loop.run_in_executor(None, lambda rp=remote_path: nc_client.create_share_link(rp))
                         text += f"🔗 {share_url}\n\n"
                     else:
-                        text += f"📁 저장됨: `{remote_path}` (공유링크 비활성)\n\n"
+                        text += f"📁 저장됨: `{_code(remote_path)}` (공유링크 비활성)\n\n"
                 except Exception as e:
-                    text += f"⚠️ Nextcloud 업로드 실패: {e}\n\n"
+                    text += f"⚠️ Nextcloud 업로드 실패: `{_code(str(e)[:200])}`\n\n"
                     
             except Exception as e:
-                text += f"❌ {manifest_path.name} 복원 실패: {e}\n\n"
+                text += f"❌ `{_code(manifest_path.name)}` 복원 실패: `{_code(str(e)[:200])}`\n\n"
         
         # manifest 없이 part_*만 있는 경우
         if not manifests and part_files:
@@ -560,16 +561,16 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             return output_path
                         restored_path = await loop.run_in_executor(None, _restore_group)
                         restored_files.append(restored_path)
-                        text += f"✅ 복원 완료 (manifest 없이): `{restored_path.name}` ({format_size(restored_path.stat().st_size)})\n"
+                        text += f"✅ 복원 완료 (manifest 없이): `{_code(restored_path.name)}` ({format_size(restored_path.stat().st_size)})\n"
                     except Exception as e:
-                        text += f"❌ {orig_name} 복원 실패: {e}\n"
+                        text += f"❌ `{_code(orig_name)}` 복원 실패: `{_code(str(e)[:200])}`\n"
             except Exception as e:
-                text += f"❌ manifest 없는 복원 실패: {e}\n"
+                text += f"❌ manifest 없는 복원 실패: `{_code(str(e)[:200])}`\n"
         
         if not restored_files:
             text += "\n❌ 복원된 파일 없음. 조각이 모두 모였는지 확인하세요."
         
-        await update.message.reply_text(text[:4000], parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await update.message.reply_text(truncate_lines(text.split("\n")), parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
         
     except Exception as e:
         logger.exception(f"Merge command failed: {e}")
@@ -599,7 +600,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     status_msg = await update.message.reply_text(
         f"📦 **대용량 파일 전송 준비**\n"
-        f"경로: `{file_path_str}`\n"
+        f"경로: `{_code(file_path_str)}`\n"
         f"상태: 파일 확인 중...",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -629,8 +630,8 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         message_id=status_msg.message_id,
                         text=f"⛔ **보안 차단**\n"
                              f"요청한 파일이 다운로드 폴더 외부에 있습니다:\n"
-                             f"`{file_path_str}`\n\n"
-                             f"보안상 `/sendlarge`는 `{download_dir}` 내부 파일만 전송할 수 있습니다.\n"
+                             f"`{_code(file_path_str)}`\n\n"
+                             f"보안상 `/sendlarge`는 `{_code(download_dir)}` 내부 파일만 전송할 수 있습니다.\n"
                              f"Nextcloud 경로는 `/PikPakBot/...` 형식으로 입력하세요.\n"
                              f"예: `/sendlarge /PikPakBot/2026-09-10/video.mp4`",
                         parse_mode=ParseMode.MARKDOWN
@@ -663,7 +664,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         message_id=status_msg.message_id,
                         text=f"⛔ **보안 차단**\n"
                              f"`/{nc_base}/` 내부 경로만 전송할 수 있습니다.\n"
-                             f"입력: `{file_path_str}`",
+                             f"입력: `{_code(file_path_str)}`",
                         parse_mode=ParseMode.MARKDOWN
                     )
                     return
@@ -687,8 +688,8 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 message_id=status_msg.message_id,
                 text=f"📥 **Nextcloud에서 다운로드 중**\n"
-                     f"경로: `{remote_path_for_download}`\n"
-                     f"로컬: `{local_path}`\n"
+                     f"경로: `{_code(remote_path_for_download)}`\n"
+                     f"로컬: `{_code(local_path)}`\n"
                      f"상태: WebDAV 스트리밍 다운로드 중... (메모리 효율)",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -710,7 +711,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             chat_id=update.effective_chat.id,
                             message_id=status_msg.message_id,
                             text=f"📥 **Nextcloud 재시도**\n"
-                                 f"경로: `{alt_remote}`\n"
+                                 f"경로: `{_code(alt_remote)}`\n"
                                  f"상태: 다운로드 중...",
                             parse_mode=ParseMode.MARKDOWN
                         )
@@ -724,9 +725,9 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             message_id=status_msg.message_id,
                             text=f"❌ **Nextcloud 다운로드 실패**\n"
                                  f"시도한 경로:\n"
-                                 f"1. `{file_path_str}`\n"
-                                 f"2. `{alt_remote}`\n\n"
-                                 f"오류: `{str(e2)[:500]}`\n\n"
+                                 f"1. `{_code(file_path_str)}`\n"
+                                 f"2. `{_code(alt_remote)}`\n\n"
+                                 f"오류: `{_code(str(e2)[:500])}`\n\n"
                                  f"Nextcloud에 파일이 존재하는지 확인하세요.\n"
                                  f"`/list`로 목록을 확인하거나 정확한 경로를 입력하세요.",
                             parse_mode=ParseMode.MARKDOWN
@@ -737,8 +738,8 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         chat_id=update.effective_chat.id,
                         message_id=status_msg.message_id,
                         text=f"❌ **Nextcloud 다운로드 실패**\n"
-                             f"경로: `{remote_path_for_download}`\n"
-                             f"오류: `{str(e)[:500]}`",
+                             f"경로: `{_code(remote_path_for_download)}`\n"
+                             f"오류: `{_code(str(e)[:500])}`",
                         parse_mode=ParseMode.MARKDOWN
                     )
                     return
@@ -748,7 +749,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=status_msg.message_id,
-                text=f"❌ 파일을 찾을 수 없습니다: `{file_path_str}`",
+                text=f"❌ 파일을 찾을 수 없습니다: `{_code(file_path_str)}`",
                 parse_mode=ParseMode.MARKDOWN
             )
             return
@@ -774,7 +775,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 message_id=status_msg.message_id,
                 text=f"📤 **파일 전송 중** (분할 불필요, 스트리밍)\n"
-                     f"파일: `{local_path.name}` ({format_size(file_size)})\n"
+                     f"파일: `{_code(local_path.name)}` ({format_size(file_size)})\n"
                      f"상태: Telegram으로 스트리밍 전송 중...",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -835,7 +836,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 message_id=status_msg.message_id,
                 text=f"✅ **전송 완료**\n"
-                     f"파일: `{local_path.name}` ({format_size(file_size)})\n"
+                     f"파일: `{_code(local_path.name)}` ({format_size(file_size)})\n"
                      f"방식: 스트리밍 (메모리 효율)",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -866,7 +867,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             message_id=status_msg.message_id,
             text=f"📦 **대용량 파일 분할 전송**\n"
-                 f"파일: `{local_path.name}` ({format_size(file_size)})\n"
+                 f"파일: `{_code(local_path.name)}` ({format_size(file_size)})\n"
                  f"조각: {total_parts}개 (1,900MB씩)\n"
                  f"상태: 스트리밍 분할 전송 시작... (메모리 효율)",
             parse_mode=ParseMode.MARKDOWN
@@ -880,7 +881,7 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id=update.effective_chat.id,
             message_id=status_msg.message_id,
             text=f"✅ **분할 전송 완료**\n"
-                 f"파일: `{local_path.name}` ({format_size(file_size)})\n"
+                 f"파일: `{_code(local_path.name)}` ({format_size(file_size)})\n"
                  f"조각: {len(results) if results else total_parts}개 전송됨\n\n"
                  f"받는 쪽에서 모든 조각 + .tgparts.json을 같은 폴더에 저장 후:\n"
                  f"`python telegram_large_file.py merge {local_path.name}.tgparts.json`\n"
@@ -903,8 +904,8 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_id=update.effective_chat.id,
                 message_id=status_msg.message_id,
                 text=f"❌ **전송 실패**\n"
-                     f"파일: `{file_path_str}`\n"
-                     f"오류: `{str(e)[:500]}`",
+                     f"파일: `{_code(file_path_str)}`\n"
+                     f"오류: `{_code(str(e)[:500])}`",
                 parse_mode=ParseMode.MARKDOWN
             )
         except:
@@ -1092,7 +1093,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
             f"📥 **텔레그램 파일 수신{forward_tag}**\n"
             # ROUND-5 FIX: 타입값을 백틱으로 감쌈 (video_note 등의 _가 Markdown 엔티티로 파싱되어 BadRequest)
             f"타입: `{media_type}`\n"
-            f"파일: `{file_name}`\n"
+            f"파일: `{_code(file_name)}`\n"
             f"크기: {format_size(file_size) if file_size else '알 수 없음'}\n"
             f"상태: Telegram에서 다운로드 중...",
             parse_mode=ParseMode.MARKDOWN
@@ -1157,7 +1158,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
             chat_id=update.effective_chat.id,
             message_id=status_msg.message_id,
             text=f"☁️ **Nextcloud 업로드 중{forward_tag}**\n"
-                 f"파일: `{local_path.name}`\n"
+                 f"파일: `{_code(local_path.name)}`\n"
                  f"크기: {format_size(local_path.stat().st_size)}\n"
                  f"상태: 업로드 중...",
             parse_mode=ParseMode.MARKDOWN
@@ -1190,9 +1191,9 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
         result_text = (
             f"✅ **완료!{forward_tag}**\n"
             f"타입: `{media_type}`\n"
-            f"파일: `{local_path.name}` ({format_size(local_path.stat().st_size)})\n\n"
+            f"파일: `{_code(local_path.name)}` ({format_size(local_path.stat().st_size)})\n\n"
             f"**Nextcloud 저장 위치:**\n"
-            f"`{base_remote}`\n\n"
+            f"`{_code(base_remote)}`\n\n"
             f"🔗 {share_url}"
         )
         
@@ -1216,7 +1217,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
                         await context.bot.send_message(
                             chat_id=update.effective_chat.id,
                             text=f"🎉 **자동 복원 완료!**\n"
-                                 f"파일: `{restored.name}` ({format_size(restored.stat().st_size)})\n"
+                                 f"파일: `{_code(restored.name)}` ({format_size(restored.stat().st_size)})\n"
                                  f"원본이 복원되었습니다. Nextcloud에도 업로드됩니다.",
                             parse_mode=ParseMode.MARKDOWN
                         )
@@ -1228,7 +1229,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
                                 await context.bot.send_message(
                                     chat_id=update.effective_chat.id,
                                     text=f"✅ **복원 파일 Nextcloud 업로드 완료**\n"
-                                         f"파일: `{restored.name}`\n🔗 {restored_share}",
+                                         f"파일: `{_code(restored.name)}`\n🔗 {restored_share}",
                                     parse_mode=ParseMode.MARKDOWN,
                                     disable_web_page_preview=True
                                 )
@@ -1236,7 +1237,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
                                 await context.bot.send_message(
                                     chat_id=update.effective_chat.id,
                                     text=f"✅ **복원 파일 Nextcloud 업로드 완료**\n"
-                                         f"파일: `{restored.name}`\n📁 `{restored_remote}`",
+                                         f"파일: `{_code(restored.name)}`\n📁 `{_code(restored_remote)}`",
                                     parse_mode=ParseMode.MARKDOWN
                                 )
                         except Exception as e:
@@ -1258,7 +1259,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
         if "too big" in error_str.lower() or "file is too big" in error_str.lower():
             help_text = (
                 f"❌ **파일이 너무 커요**\n"
-                f"파일: `{file_name}` ({format_size(file_size) if file_size else '대용량'})\n\n"
+                f"파일: `{_code(file_name)}` ({format_size(file_size) if file_size else '대용량'})\n\n"
                 f"**공식 문서 기준:**\n"
                 f"• 다운로드 (봇이 받는 것):\n"
                 f"  - 공식 Bot API: 20MB 제한\n"
@@ -1285,7 +1286,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.edit_message_text(
                     chat_id=update.effective_chat.id,
                     message_id=status_msg.message_id,
-                    text=f"❌ **실패**\n파일: `{file_name}`\n오류: `{error_str[:500]}`",
+                    text=f"❌ **실패**\n파일: `{_code(file_name)}`\n오류: `{_code(error_str[:500])}`",
                     parse_mode=ParseMode.MARKDOWN
                 )
             except:
@@ -1318,7 +1319,7 @@ async def process_single_link(url: str, update: Update, context: ContextTypes.DE
         f"📥 **대기열 추가**\n"
         f"ID: `{task_id}`\n"
         f"타입: `{detected['type']}`\n"
-        f"링크: `{url[:80]}...`\n"
+        f"링크: `{_code(url[:80])}...`\n"
         f"상태: 대기 중...",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -1411,7 +1412,7 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
             chat_id=task.chat_id, message_id=task.message_id,
             text=f"☁️ **Nextcloud 업로드 중**\n"
                  f"ID: `{task.id}`\n"
-                 f"파일: `{Path(local_path).name}`\n"
+                 f"파일: `{_code(Path(local_path).name)}`\n"
                  f"크기: {format_size(Path(local_path).stat().st_size) if Path(local_path).is_file() else format_size(total_size)}\n"
                  f"상태: 업로드 준비...",
             parse_mode=ParseMode.MARKDOWN
@@ -1462,7 +1463,7 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
                     chat_id=task.chat_id, message_id=task.message_id,
                     text=f"☁️ **Nextcloud 업로드 중** ({idx+1}/{len(files_to_upload)})\n"
                          f"ID: `{task.id}`\n"
-                         f"현재: `{file_path.name}`\n"
+                         f"현재: `{_code(file_path.name)}`\n"
                          f"{progress_bar(idx+1, len(files_to_upload))}",
                     parse_mode=ParseMode.MARKDOWN
                 )
@@ -1471,10 +1472,10 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
 
         # 3. 완료 메시지
         task.status = "completed"
-        result_text = f"✅ **완료!**\nID: `{task.id}`\n타입: `{task.type}`\n\n**Nextcloud 저장 위치:**\n`{base_remote}`\n\n"
+        result_text = f"✅ **완료!**\nID: `{task.id}`\n타입: `{task.type}`\n\n**Nextcloud 저장 위치:**\n`{_code(base_remote)}`\n\n"
         for remote_path, share_url, size in uploaded_links[:5]:
             # ROUND-5 FIX: 파일명도 백틱 처리 (이름 속 _ * 등이 Markdown 파괴 방지)
-            result_text += f"📄 `{Path(remote_path).name}` ({format_size(size)})\n🔗 {share_url}\n\n"
+            result_text += f"📄 `{_code(Path(remote_path).name)}` ({format_size(size)})\n🔗 {share_url}\n\n"
         if len(uploaded_links) > 5:
             result_text += f"... 외 {len(uploaded_links)-5}개 파일\n"
 
@@ -1499,7 +1500,7 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
         try:
             await context.bot.edit_message_text(
                 chat_id=task.chat_id, message_id=task.message_id,
-                text=f"❌ **실패**\nID: `{task.id}`\n오류: `{str(e)[:500]}`",
+                text=f"❌ **실패**\nID: `{task.id}`\n오류: `{_code(str(e)[:500])}`",
                 parse_mode=ParseMode.MARKDOWN
             )
         except:

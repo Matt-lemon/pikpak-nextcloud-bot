@@ -239,7 +239,17 @@ class NextcloudClient:
         remote_path = remote_path.strip('/')
         encoded = self._encode_path(remote_path)
         url = f"{self.webdav_url}/{encoded}"
-        resp = self.session.request("PROPFIND", url, headers={"Depth": "1"}, timeout=self.timeout)
+        # ROUND-7: 필요한 property를 명시 요청 (oc:size는 기본 응답에 없을 수 있음)
+        body = (
+            '<?xml version="1.0"?>'
+            '<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+            '<d:prop><d:resourcetype/><d:getcontentlength/>'
+            '<oc:size/><d:getlastmodified/></d:prop></d:propfind>'
+        )
+        resp = self.session.request(
+            "PROPFIND", url, headers={"Depth": "1", "Content-Type": "application/xml"},
+            data=body, timeout=self.timeout,
+        )
         if resp.status_code not in (200, 207):
             raise Exception(f"목록 조회 실패: HTTP {resp.status_code}")
         try:
@@ -280,14 +290,19 @@ class NextcloudClient:
                 rt = next((c for c in prop if _local(c.tag) == 'resourcetype'), None)
                 if rt is not None:
                     is_dir = any(_local(c.tag) == 'collection' for c in rt)
+                def _int_prop(*names: str) -> int:
+                    for nm in names:
+                        el = next((c for c in prop if _local(c.tag) == nm), None)
+                        if el is not None and (el.text or '').strip().isdigit():
+                            return int(el.text.strip())
+                    return 0
+                # ROUND-7: 폴더 크기는 oc:size 우선 (quota-used-bytes는
+                # 동일 quota 전체 사용량이라 폴더 실제 크기와 다를 수 있음).
+                # 구서버 호환 폴백 유지.
                 if is_dir:
-                    q = next((c for c in prop if _local(c.tag) == 'quota-used-bytes'), None)
-                    if q is not None and (q.text or '').strip().isdigit():
-                        size = int(q.text.strip())
+                    size = _int_prop('size', 'quota-used-bytes')
                 else:
-                    cl = next((c for c in prop if _local(c.tag) == 'getcontentlength'), None)
-                    if cl is not None and (cl.text or '').strip().isdigit():
-                        size = int(cl.text.strip())
+                    size = _int_prop('getcontentlength', 'size')
                 lm = next((c for c in prop if _local(c.tag) == 'getlastmodified'), None)
                 if lm is not None and lm.text:
                     modified = lm.text.strip()

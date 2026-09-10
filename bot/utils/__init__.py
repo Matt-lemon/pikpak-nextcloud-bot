@@ -80,6 +80,26 @@ def safe_join(base: Path, *parts: str) -> Path:
         raise ValueError(f"경로가 허용 폴더를 벗어남: {target} (base: {base_resolved})")
     return target
 
+def truncate_lines(lines, budget: int = 3400, note: str = "...(길이 제한으로 잘림)") -> str:
+    """완성된 줄 단위로 예산까지만 누적 (ROUND-7).
+
+    문자열 강제 절단(text[:N])은 Markdown 코드스팬 중간을 잘라
+    'Can't parse entities' 전송 실패를 유발하므로 금지.
+    lines[0](헤더)은 항상 포함.
+    """
+    lines = list(lines or [])
+    if not lines:
+        return ""
+    out, total = [lines[0]], len(lines[0]) + 1
+    for line in lines[1:]:
+        extra = len(line) + 1
+        if total + extra > budget:
+            out.append(note)
+            break
+        out.append(line)
+        total += extra
+    return "\n".join(out)
+
 def safe_filename(name: str) -> str:
     # 파일명에서 위험 문자 제거
     keep = (" ", ".", "_", "-", "(", ")", "[", "]")

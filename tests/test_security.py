@@ -218,7 +218,7 @@ class TestMarkdownSafety:
 
 
 PROPFIND_SAMPLE = """<?xml version="1.0"?>
-<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
+<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns" xmlns:oc="http://owncloud.org/ns">
  <d:response>
   <d:href>/remote.php/dav/files/mir2mix/PikPakBot/</d:href>
   <d:propstat><d:prop>
@@ -230,7 +230,15 @@ PROPFIND_SAMPLE = """<?xml version="1.0"?>
   <d:href>/remote.php/dav/files/mir2mix/PikPakBot/2026-09-10/</d:href>
   <d:propstat><d:prop>
    <d:resourcetype><d:collection/></d:resourcetype>
-   <d:quota-used-bytes>2930883868</d:quota-used-bytes>
+   <oc:size>2930883868</oc:size>
+   <d:quota-used-bytes>9999999999</d:quota-used-bytes>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/remote.php/dav/files/mir2mix/PikPakBot/oldfolder/</d:href>
+  <d:propstat><d:prop>
+   <d:resourcetype><d:collection/></d:resourcetype>
+   <d:quota-used-bytes>12345</d:quota-used-bytes>
   </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
  </d:response>
  <d:response>
@@ -263,10 +271,23 @@ class TestPropfindParsing:
         # 자기 자신 제외, 폴더 먼저
         assert [(e["name"], e["is_dir"]) for e in entries] == [
             ("2026-09-10", True),
+            ("oldfolder", True),
             ("영상.mp4", False),  # URL 디코딩 확인
         ]
-        assert entries[0]["size"] == 2930883868  # quota-used-bytes
-        assert entries[1]["size"] == 1226213048  # getcontentlength
+        # 폴더 크기는 oc:size 우선 (quota 값 9999999999가 아님)
+        assert entries[0]["size"] == 2930883868
+        # oc:size 없는 구서버 응답은 quota 폴백
+        assert entries[1]["size"] == 12345
+        assert entries[2]["size"] == 1226213048  # getcontentlength
+
+    def test_propfind_body_requests_oc_size(self):
+        from unittest.mock import MagicMock
+        c = self._client_with(207, PROPFIND_SAMPLE)
+        c.list_dir("PikPakBot")
+        _, kwargs = c.session.request.call_args
+        assert kwargs["headers"]["Depth"] == "1"
+        assert "oc:size" in kwargs["data"]
+        assert "getcontentlength" in kwargs["data"]
 
     def test_empty_folder(self):
         only_self = PROPFIND_SAMPLE.split("<d:response>")[0] + "<d:response>" + \
@@ -332,6 +353,27 @@ class TestListContainment:
         assert remote == "PikPakBot/etc"  # .. 제거되어 base 내부로 강제됨
         remote, _ = self._run_list(["/etc/passwd"])
         assert remote == "PikPakBot/etc/passwd"  # 절대경로도 상대경로로 해석
+
+
+class TestTruncateLines:
+    """ROUND-7: 줄 단위 절단 (문자열 강제 절단은 코드스팬 파괴)."""
+
+    def test_keeps_spans_whole(self):
+        from bot.utils import truncate_lines
+        lines = ["header"] + [
+            f"📄 `very_long_filename_{i:03d}_xxxxxxxxxxxxxxxx.mp4` (1.0 GiB)"
+            for i in range(30)
+        ]
+        out = truncate_lines(lines, budget=200)
+        assert out.count("`") % 2 == 0, "백틱 개수가 홀수 = 코드스팬 절단됨"
+        assert out.endswith("...(길이 제한으로 잘림)")
+        for ln in out.split("\n")[:-1]:
+            assert ln in lines, "부분 잘린 줄 존재"
+
+    def test_short_passthrough(self):
+        from bot.utils import truncate_lines
+        assert truncate_lines(["a", "b"]) == "a\nb"
+        assert truncate_lines([]) == ""
 
 
 class TestPTBStreaming:

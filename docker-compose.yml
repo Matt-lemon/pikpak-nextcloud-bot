@@ -1,0 +1,40 @@
+version: '3.8'
+
+services:
+  aria2:
+    image: p3terx/aria2-pro
+    container_name: pikpak-aria2
+    restart: unless-stopped
+    environment:
+      - RPC_SECRET=${ARIA2_SECRET:-pikpak_secret}
+      - RPC_PORT=6800
+      - LISTEN_PORT=6888
+    volumes:
+      - ./downloads:/downloads
+      - ./aria2-config:/config
+    ports:
+      - "6800:6800"
+      - "6888:6888"
+      - "6888:6888/udp"
+    networks:
+      - pikpak-net
+
+  bot:
+    build: .
+    container_name: pikpak-bot
+    restart: unless-stopped
+    depends_on:
+      - aria2
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/downloads
+      - ./logs:/app/logs
+    environment:
+      - ARIA2_HOST=http://aria2:6800
+    networks:
+      - pikpak-net
+
+networks:
+  pikpak-net:
+    driver: bridge

@@ -1,0 +1,27 @@
+bot:
+  name: "PikPak Clone Bot"
+  language: "ko"
+  max_file_size_gb: 20
+
+download:
+  # PikPak처럼 모든 링크 지원
+  http:
+    enabled: true
+    max_size: 20GB
+  torrent:
+    enabled: true
+    use_aria2: true
+    seed_time: 0  # 0이면 시드 안함
+  ytdlp:
+    enabled: true
+    format: "bestvideo[ext=mp4]+bestaudio/best"
+    sites: ["youtube.com", "youtu.be", "twitter.com", "x.com", "instagram.com", "tiktok.com"]
+
+nextcloud:
+  create_share_link: true
+  share_permissions: 1  # 1=읽기만
+  auto_create_folder_per_date: true  # /PikPakBot/2024-09-10/ 형식
+
+notifications:
+  send_progress_every: 5  # 5%마다 진행률 업데이트
+  send_thumbnail: true

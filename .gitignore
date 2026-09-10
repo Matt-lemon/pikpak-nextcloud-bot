@@ -1,0 +1,19 @@
+# Secrets
+.env
+*.env
+!.env.example
+!.env.mir2mix
+
+# Runtime
+downloads/
+logs/
+aria2-config/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.DS_Store
+
+# Docker
+aria2-session.txt

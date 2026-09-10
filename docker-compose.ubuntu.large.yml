@@ -1,0 +1,83 @@
+# 대용량 파일 지원 버전 - 로컬 Bot API 서버 포함 (20MB -> 2GB)
+# 사용법: docker compose -f docker-compose.ubuntu.large.yml up -d
+# 3.2GB 같은 파일은 여전히 Bot API 2GB 제한 때문에 불가 - UserBot 필요
+
+services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_API_ID=${TELEGRAM_API_ID:-}
+      - TELEGRAM_API_HASH=${TELEGRAM_API_HASH:-}
+      - TELEGRAM_LOCAL=true
+    volumes:
+      - ./bot-api-data:/var/lib/telegram-bot-api
+    ports:
+      - "127.0.0.1:8081:8081"
+    command: >
+      --local
+      --http-port 8081
+      --dir=/var/lib/telegram-bot-api
+      --temp-dir=/var/lib/telegram-bot-api/temp
+    networks:
+      - pikpak-net
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+
+  aria2:
+    image: p3terx/aria2-pro
+    container_name: pikpak-aria2
+    restart: unless-stopped
+    environment:
+      - RPC_SECRET=${ARIA2_SECRET:-mir2mix_pikpak_2024}
+      - RPC_PORT=6800
+      - LISTEN_PORT=6888
+      - IPV6_MODE=false
+      - UMASK_SET=022
+    volumes:
+      - ./downloads:/downloads
+      - ./aria2-config:/config
+    ports:
+      - "127.0.0.1:6800:6800"
+      - "6888:6888"
+      - "6888:6888/udp"
+    networks:
+      - pikpak-net
+
+  bot:
+    build: .
+    container_name: pikpak-bot
+    restart: unless-stopped
+    depends_on:
+      - aria2
+      - telegram-bot-api
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/downloads
+      - ./logs:/app/logs
+      - ./bot-api-data:/var/lib/telegram-bot-api:ro  # 로컬 Bot API 다운로드 폴더 공유 (다운로드는 제한 없음)
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - ARIA2_HOST=http://aria2:6800
+      - TELEGRAM_BOT_API_URL=http://telegram-bot-api:8081  # 로컬 API - 다운로드 무제한, 업로드 2,000MB
+      - TZ=Asia/Seoul
+    networks:
+      - pikpak-net
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+
+networks:
+  pikpak-net:
+    driver: bridge

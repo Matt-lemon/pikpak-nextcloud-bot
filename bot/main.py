@@ -1,12 +1,14 @@
 import os
+import asyncio
 import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from .handlers import (
     start_command, help_command, status_command, list_command,
-    merge_command, sendlarge_command,
+    cleanup_command, merge_command, sendlarge_command,
     handle_message, init_managers, purge_old_downloads,
     handle_video, handle_audio, handle_photo, handle_voice,
     handle_video_note, handle_animation
@@ -125,12 +127,63 @@ def main():
         pool_timeout=60
     )
     
+    # 빈 폴더 일일 정리 스케줄러 (매일 로컬 시각 hour:minute 실행)
+    async def _daily_cleanup_loop(app):
+        from .maintenance import cleanup_empty_dirs
+        from . import handlers as _h
+        while True:
+            cfg = config.get("cleanup", {}) or {}
+            try:
+                hour, minute = int(cfg.get("hour", 4)), int(cfg.get("minute", 0))
+            except (TypeError, ValueError):
+                hour, minute = 4, 0
+            now = datetime.now().astimezone()
+            nxt = now.replace(hour=hour % 24, minute=minute % 60, second=0, microsecond=0)
+            if nxt <= now:
+                nxt += timedelta(days=1)
+            logger.info(f"🧹 다음 빈 폴더 정리: {nxt.strftime('%m-%d %H:%M')}")
+            await asyncio.sleep((nxt - now).total_seconds())
+            try:
+                stats = await asyncio.to_thread(
+                    cleanup_empty_dirs, _h.nc_client, _h.nc_client.base_path,
+                    int(cfg.get("min_age_hours", 24)))
+                logger.info(f"🧹 일일 정리 완료: 검사 {stats['scanned']}, 삭제 {len(stats['deleted'])}, 오류 {len(stats['errors'])}")
+                # 삭제/오류가 있을 때만 첫 허용 사용자에게 알림 (plain text)
+                if (stats["deleted"] or stats["errors"]) and cfg.get("notify", True) and allowed_ids:
+                    first_id = allowed_ids.split(",")[0].strip()
+                    if first_id.isdigit():
+                        lines = [f"🧹 빈 폴더 일일 정리: {len(stats['deleted'])}개 삭제"]
+                        for p in stats["deleted"][:15]:
+                            lines.append(f"• {p}/")
+                        for err in stats["errors"][:5]:
+                            lines.append(f"⚠️ {err}")
+                        try:
+                            await app.bot.send_message(chat_id=int(first_id), text="\n".join(lines)[:4000])
+                        except Exception as e:
+                            logger.warning(f"정리 알림 전송 실패: {e}")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("일일 빈 폴더 정리 실패")
+
+    async def post_init(app):
+        cfg = config.get("cleanup", {}) or {}
+        if not cfg.get("enabled", True):
+            logger.info("🧹 빈 폴더 일일 정리: 비활성화됨 (config.yaml cleanup.enabled=false)")
+            return
+        try:
+            hour, minute = int(cfg.get("hour", 4)), int(cfg.get("minute", 0))
+        except (TypeError, ValueError):
+            hour, minute = 4, 0
+        app.create_task(_daily_cleanup_loop(app), name="nc-cleanup")
+        logger.info(f"🧹 빈 폴더 일일 정리 예약됨 (매일 {hour % 24:02d}:{minute % 60:02d} 로컬 시각)")
+
     if bot_api_url:
         logger.info(f"🌐 로컬 Bot API 사용: {bot_api_url} (다운로드 무제한, 업로드 2,000MB)")
-        app = Application.builder().token(token).request(request).base_url(f"{bot_api_url}/bot").base_file_url(f"{bot_api_url}/file/bot").build()
+        app = Application.builder().token(token).request(request).base_url(f"{bot_api_url}/bot").base_file_url(f"{bot_api_url}/file/bot").post_init(post_init).build()
     else:
         logger.info(f"ℹ️ 공식 Bot API 사용 (다운로드 20MB 제한, 대용량은 로컬 API 필요)")
-        app = Application.builder().token(token).request(request).build()
+        app = Application.builder().token(token).request(request).post_init(post_init).build()
 
     # 에러 핸들러 (봇 크래시 방지)
     async def error_handler(update, context):
@@ -147,6 +200,7 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("list", list_command))
+    app.add_handler(CommandHandler("cleanup", cleanup_command))
     app.add_handler(CommandHandler("merge", merge_command))
     app.add_handler(CommandHandler("sendlarge", sendlarge_command))
     

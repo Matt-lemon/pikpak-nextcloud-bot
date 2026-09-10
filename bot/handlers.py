@@ -379,6 +379,7 @@ PikPak처럼 링크만 보내면 Nextcloud에 자동 저장!
 /help - 도움말
 /status - 큐 상태 확인
 /list - Nextcloud 파일 목록
+/cleanup - Nextcloud 빈 폴더 정리 (매일 새벽 자동 실행)
 /merge - 분할된 파일 자동 복원
 /sendlarge <경로> - Nextcloud의 대용량 파일을 텔레그램으로 분할 전송
 
@@ -450,6 +451,38 @@ async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ 목록 조회 실패: {str(e)[:300]}")
+
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cleanup - Nextcloud 빈 폴더 즉시 정리 (수동 실행)."""
+    if not check_permission(update.effective_user.id):
+        await update.message.reply_text("⛔ 권한이 없습니다.")
+        return
+    from .maintenance import cleanup_empty_dirs
+    cfg = CONFIG.get("cleanup", {}) or {}
+    min_age = int(cfg.get("min_age_hours", 24))
+    status = await update.message.reply_text("🔍 빈 폴더 검사 중...")
+    try:
+        loop = asyncio.get_running_loop()
+        stats = await loop.run_in_executor(
+            None, cleanup_empty_dirs, nc_client, nc_client.base_path, min_age)
+    except Exception as e:
+        await status.edit_text(f"❌ 정리 실패: `{_code(str(e)[:300])}`",
+                               parse_mode=ParseMode.MARKDOWN)
+        return
+    lines = [f"🧹 빈 폴더 정리 완료 (검사 {stats['scanned']}개 폴더)"]
+    if stats["deleted"]:
+        lines.append(f"삭제: {len(stats['deleted'])}개")
+        for p in stats["deleted"][:20]:
+            lines.append(f"• `{_code(p)}/`")
+        if len(stats["deleted"]) > 20:
+            lines.append(f"외 {len(stats['deleted']) - 20}개")
+    else:
+        lines.append("삭제: 없음 (빈 폴더 없음)")
+    if stats["skipped_recent"]:
+        lines.append(f"유지: 최근 폴더 {stats['skipped_recent']}개")
+    for err in stats["errors"][:5]:
+        lines.append(f"⚠️ `{_code(err)}`")
+    await status.edit_text(truncate_lines(lines), parse_mode=ParseMode.MARKDOWN)
 
 async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """분할된 파일 자동 복원 명령어"""

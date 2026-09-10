@@ -311,6 +311,14 @@ class NextcloudClient:
         entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
         return entries
 
+    def delete_dir(self, remote_path: str):
+        """빈 폴더 삭제 (WebDAV DELETE). 빈 폴더 일일 정리용."""
+        encoded = self._encode_path(remote_path.strip('/'))
+        url = f"{self.webdav_url}/{encoded}"
+        resp = self.session.request("DELETE", url, timeout=self.timeout)
+        if resp.status_code not in (200, 202, 204):
+            raise Exception(f"폴더 삭제 실패: HTTP {resp.status_code}")
+
     def get_quota(self):
         try:
             resp = self.session.request("PROPFIND", self.webdav_url, headers={"Depth": "0"}, timeout=self.timeout)

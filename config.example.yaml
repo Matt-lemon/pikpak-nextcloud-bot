@@ -30,6 +30,14 @@ notifications:
   send_progress_every: 5  # 5%마다 진행률 업데이트
   send_thumbnail: true
 
+# 빈 폴더 일일 정리 (PikPakBot 하위 재귀 스캔, bottom-up 삭제)
+cleanup:
+  enabled: true
+  hour: 4          # 매일 실행 시각 (서버 로컬 시간)
+  minute: 0
+  min_age_hours: 24  # 이보다 최근에 변경된 폴더는 보호 (당일 작업 폴더 등)
+  notify: true     # 삭제/오류 발생 시 첫 허용 사용자에게 알림 (없으면 조용히 통과)
+
 # 보안 설정 (코드에서 .env로 관리되지만 문서화)
 security:
   # ALLOWED_USER_IDS는 .env에서 필수 - 비어있으면 봇 시작 거부 (Critical fix)

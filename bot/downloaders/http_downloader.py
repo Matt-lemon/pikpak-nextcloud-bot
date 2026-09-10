@@ -5,97 +5,109 @@ import ipaddress
 import socket
 from pathlib import Path
 import logging
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urljoin
 import re
 
 logger = logging.getLogger(__name__)
 
 # SSRF 방어를 위한 차단 목록
 BLOCKED_HOSTS = {
-    'localhost', '127.0.0.1', '0.0.0.0', '::1',
+    'localhost', '127.0.0.1', '0.0.0.0', '::1', '::',
     'aria2', 'telegram-bot-api', 'bot', 'dashboard',
 }
 
-# Private IP 대역
-PRIVATE_NETWORKS = [
-    ipaddress.ip_network('127.0.0.0/8'),      # Loopback
-    ipaddress.ip_network('10.0.0.0/8'),       # Private
-    ipaddress.ip_network('172.16.0.0/12'),    # Private
-    ipaddress.ip_network('192.168.0.0/16'),   # Private
-    ipaddress.ip_network('169.254.0.0/16'),   # Link-local + AWS metadata
-    ipaddress.ip_network('::1/128'),          # IPv6 loopback
-    ipaddress.ip_network('fc00::/7'),         # IPv6 private
-    ipaddress.ip_network('fe80::/10'),        # IPv6 link-local
-]
+# 내부 전용 도메인 접미사
+BLOCKED_SUFFIXES = (
+    '.local', '.internal', '.lan', '.home', '.home.arpa',
+    '.localdomain', '.intranet', '.invalid', '.test',
+)
 
 def _is_blocked_ip(ip_str: str) -> bool:
-    """IP가 차단된 대역인지 확인"""
+    """IP가 차단 대상인지 확인.
+
+    SECURITY FIX (2026-09-10 감사): allowlist 방식으로 변경.
+    - 기존: PRIVATE_NETWORKS 블랙리스트 -> 0.0.0.0('http://0/'),
+      '::', CGNAT(100.64/10)가 빠져서 SSRF 우회 가능했음 (실측 확인).
+      예: http://0/ 은 검증 통과 후 localhost에 실제 연결됨.
+    - 수정: is_global이 아닌 모든 IP 차단 (loopback/private/link-local/
+      reserved/unspecified/CGNAT 포함) + 멀티캐스트 명시 차단.
+    """
     try:
         ip = ipaddress.ip_address(ip_str)
-        for net in PRIVATE_NETWORKS:
-            if ip in net:
-                return True
-        # 0.0.0.0, metadata service 등
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            # 하지만 public IP 중 private으로 잘못 분류되는 것 방지
-            # is_private는 CGNAT도 포함하므로 네트워크 리스트로 재확인
-            pass
-        return False
-    except:
+        if ip.is_multicast:
+            return True
+        return not ip.is_global
+    except Exception:
+        # 파싱 불가 = IP가 아님 -> 여기서 판단하지 않음
         return False
 
 def _is_safe_url(url: str) -> tuple[bool, str]:
-    """URL이 SSRF 안전한지 검사"""
+    """URL이 SSRF 안전한지 검사 (요청 전송 *전*에 호출해야 함)"""
     try:
         parsed = urlparse(url)
-        
+
         # 스킴 검사
         if parsed.scheme not in ('http', 'https'):
             return False, f"허용되지 않는 스킴: {parsed.scheme}"
-        
+
+        # userinfo(URL에 박힌 계정 정보) 차단 - 내부 서비스 인증 혼동 방지
+        if parsed.username or parsed.password:
+            return False, "URL에 사용자 정보 포함 금지"
+
         host = parsed.hostname
         if not host:
             return False, "호스트 없음"
-        
-        host_lower = host.lower()
-        
+
+        host_lower = host.lower().rstrip('.')
+
         # 차단된 호스트명
         if host_lower in BLOCKED_HOSTS:
             return False, f"차단된 호스트: {host}"
-        
+
         # 내부 도메인 차단
-        if host_lower.endswith('.local') or host_lower.endswith('.internal'):
+        if host_lower.endswith(BLOCKED_SUFFIXES):
             return False, f"내부 도메인 차단: {host}"
-        
-        # IP 직접 사용 시 검사
+
+        # 단일 레이블 호스트명 차단 (Docker/LAN 내부 이름: aria2, router 등)
+        # 공개 웹의 정상 호스트는 항상 점(.)을 포함함
         try:
-            # 호스트가 IP인지 확인
             ipaddress.ip_address(host)
+            is_ip_literal = True
+        except ValueError:
+            is_ip_literal = False
+        if not is_ip_literal and '.' not in host_lower and ':' not in host_lower:
+            return False, f"내부 호스트명으로 의심됨: {host}"
+
+        # IP 리터럴이면 직접 검사 (10진/16진/8진 표기도 여기서 처리)
+        if is_ip_literal:
             if _is_blocked_ip(host):
                 return False, f"차단된 IP 대역: {host}"
-        except ValueError:
-            # 호스트명이 IP가 아니면 DNS 조회 필요
-            # DNS rebinding 방지를 위해 resolve 후 IP 검사
+        else:
+            # 호스트명: DNS resolve 후 *모든* 결과 IP 검사
+            # (숫자형 표기 '2130706433' 등은 여기서 127.0.0.1로 확인되어 차단됨)
             try:
-                # 동기 DNS 조회 (보안상 필요)
                 infos = socket.getaddrinfo(host, None, family=socket.AF_UNSPEC, type=socket.SOCK_STREAM)
-                for info in infos:
-                    ip_str = info[4][0]
-                    if _is_blocked_ip(ip_str):
-                        return False, f"차단된 IP로 resolve됨: {host} -> {ip_str}"
             except socket.gaierror:
-                # DNS 조회 실패는 일단 허용 (다운로드 시 실패할 것)
-                pass
+                # SECURITY: 조회 실패 시 fail-closed (기존엔 허용했음)
+                return False, f"DNS 조회 실패: {host}"
             except Exception as e:
                 logger.warning(f"DNS 검사 실패 {host}: {e}")
-        
-        # 메타데이터 서비스 URL 패턴 차단
+                return False, f"DNS 검사 오류: {host}"
+            for info in infos:
+                ip_str = info[4][0]
+                if _is_blocked_ip(ip_str):
+                    return False, f"차단된 IP로 resolve됨: {host} -> {ip_str}"
+
+        # 메타데이터 서비스 URL 패턴 차단 (방어 심화)
         if '169.254.169.254' in url or 'metadata.google' in host_lower:
             return False, "메타데이터 서비스 차단"
-        
+
         return True, ""
     except Exception as e:
         return False, f"URL 검사 오류: {e}"
+
+# 공개 별칭 (다른 모듈에서 import용)
+is_safe_url = _is_safe_url
 
 def _safe_filename(filename: str, download_dir: Path) -> Path:
     """파일명 Path Traversal 방지 + safe_name 적용"""
@@ -182,15 +194,42 @@ class HttpDownloader:
             except:
                 pass
         
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                # 리다이렉트 후 최종 URL도 SSRF 검사
+        # SECURITY FIX (2026-09-10 감사): 리다이렉트를 수동으로 처리.
+        # - 기존: allow_redirects=True 후 최종 URL을 *사후* 검사 -> 내부
+        #   서버로 향하는 HTTP 요청이 이미 전송된 뒤라 blind-SSRF 가능.
+        # - 수정: allow_redirects=False + 매 hop마다 요청 *전* 검증.
+        timeout = aiohttp.ClientTimeout(connect=30, sock_connect=30, sock_read=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            current_url = url
+            resp_ctx = None
+            resp = None
+            try:
+                for _hop in range(6):
+                    ok, reason = _is_safe_url(current_url)
+                    if not ok:
+                        raise Exception(f"⛔ 차단된 URL (SSRF 방어): {reason} ({current_url[:100]})")
+                    resp_ctx = session.get(current_url, allow_redirects=False)
+                    resp = await resp_ctx.__aenter__()
+                    if resp.status in (301, 302, 303, 307, 308) and resp.headers.get('Location'):
+                        next_url = urljoin(current_url, resp.headers['Location'])
+                        await resp_ctx.__aexit__(None, None, None)
+                        resp_ctx, resp = None, None
+                        if _hop == 5:
+                            raise Exception("⛔ 리다이렉트 횟수 초과 (6 hops)")
+                        logger.info(f"↪️ 리다이렉트 hop {_hop+1}: {current_url[:80]} -> {next_url[:80]}")
+                        current_url = next_url
+                        continue
+                    break
+                if resp is None:
+                    raise Exception("⛔ 응답 없음 (리다이렉트 처리 실패)")
+
                 final_url = str(resp.url)
                 if final_url != url:
-                    is_safe, reason = _is_safe_url(final_url)
-                    if not is_safe:
+                    # 방어 심화: 최종 URL 재확인
+                    ok, reason = _is_safe_url(final_url)
+                    if not ok:
                         raise Exception(f"⛔ 리다이렉트된 URL 차단 (SSRF): {final_url} - {reason}")
-                
+
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status} for {url}")
                 
@@ -246,3 +285,9 @@ class HttpDownloader:
                 
                 logger.info(f"HTTP downloaded: {filepath} ({downloaded} bytes)")
                 return filepath
+            finally:
+                if resp_ctx is not None:
+                    try:
+                        await resp_ctx.__aexit__(None, None, None)
+                    except Exception:
+                        pass

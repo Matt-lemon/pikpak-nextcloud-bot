@@ -66,7 +66,8 @@ def main():
         if not aria_secret:
             raise ValueError("⛔ SECURITY: ARIA2_SECRET이 비어있습니다! 강력한 랜덤 비밀번호를 .env에 설정하세요")
         else:
-            logger.warning(f"⚠️ SECURITY: ARIA2_SECRET이 기본값/예제값입니다: {aria_secret[:10]}... - 프로덕션에서는 강력한 랜덤 비밀번호로 변경 권장")
+            # SECURITY FIX (2026-09-10 감사): 시크릿 앞자리도 로그에 남기지 않음
+            logger.warning("⚠️ SECURITY: ARIA2_SECRET이 기본값/예제값입니다 - 프로덕션에서는 강력한 랜덤 비밀번호로 변경 권장")
 
     # Nextcloud 설정 체크
     required = ["NEXTCLOUD_URL", "NEXTCLOUD_USERNAME", "NEXTCLOUD_PASSWORD"]

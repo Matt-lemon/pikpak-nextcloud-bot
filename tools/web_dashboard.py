@@ -14,6 +14,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import os
 import sys
+import html
 import logging
 import secrets
 from pathlib import Path
@@ -47,40 +48,55 @@ security = HTTPBasic()
 download_queue = []
 download_history = []
 
+# SECURITY FIX (2026-09-10 감사): 대시보드 경로에도 크기/동시성 제한 적용.
+# - 기존: 대시보드는 init_managers()를 거치지 않아 CONFIG이 비어 있고,
+#   모든 다운로더의 크기 제한이 None(무제한) + 동시 실행 무제한 -> 디스크 고갈.
+import asyncio as _asyncio
+
+def _dash_max_concurrent() -> int:
+    try:
+        n = int(os.getenv("DASHBOARD_MAX_CONCURRENT", "3") or 3)
+        return n if n >= 1 else 3
+    except ValueError:
+        return 3
+
+_dash_semaphore = _asyncio.Semaphore(_dash_max_concurrent())
+
+def _dash_max_bytes() -> int:
+    try:
+        gb = float(os.getenv("MAX_FILE_SIZE_GB", "20"))
+    except ValueError:
+        gb = 20.0
+    return int(gb * 1024 ** 3)
+
 def check_dashboard_auth(credentials: HTTPBasicCredentials = Depends(security)):
     """
-    SECURITY FIX: 대시보드 인증 추가
-    기존: 인증 없음 -> 외부 노출 시 누구나 접근 가능
-    수정: DASHBOARD_USERNAME/PASSWORD 또는 ALLOWED_USER_IDS 기반 인증
+    SECURITY FIX (2026-09-10 감사): 대시보드 인증 fail-closed로 수정.
+    - 기존: DASHBOARD_USERNAME/PASSWORD 미설정 시 *어떤* Basic 인증 값이든
+      그대로 통과시켰음 (비밀번호 검증 없음). uvicorn이 0.0.0.0 바인드라
+      LAN에 노출되면 누구나 다운로드 큐 추가 + Nextcloud 공유링크 조회 가능.
+    - 수정: 인증 요구 시 전용 계정이 없으면 401로 전원 거부.
+      인증을 끄려면 명시적으로 DASHBOARD_REQUIRE_AUTH=false (비권장).
     """
     dashboard_user = os.getenv("DASHBOARD_USERNAME", "").strip()
     dashboard_pass = os.getenv("DASHBOARD_PASSWORD", "").strip()
-    
-    # 대시보드 전용 계정이 설정되어 있으면 그것 사용
-    if dashboard_user and dashboard_pass:
-        is_user_ok = secrets.compare_digest(credentials.username, dashboard_user)
-        is_pass_ok = secrets.compare_digest(credentials.password, dashboard_pass)
-        if not (is_user_ok and is_pass_ok):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid credentials",
-                headers={"WWW-Authenticate": "Basic"},
-            )
-        return credentials.username
-    
-    # 대시보드 계정이 없으면 ALLOWED_USER_IDS가 있는지 확인
-    # 없으면 인증 없이 허용하지만 경고 (로컬 전용이므로)
-    allowed = os.getenv("ALLOWED_USER_IDS", "").strip()
-    if not allowed:
-        # .env 없거나 ALLOWED_USER_IDS 비어있으면 일단 허용 (개발 환경)
-        # 하지만 프로덕션에서는 DASHBOARD_USERNAME/PASSWORD 설정 권장
-        logger.warning("⚠️ DASHBOARD_USERNAME/PASSWORD 미설정 + ALLOWED_USER_IDS 비어있음 -> 인증 없이 허용 (로컬 전용 권장)")
-        return "anonymous"
-    
-    # ALLOWED_USER_IDS가 있으면, 대시보드는 일단 허용 (IP는 127.0.0.1로 바인딩되어 있으므로)
-    # 더 엄격하게 하려면 여기서도 인증 요구 가능
-    # 여기서는 127.0.0.1 바인딩으로 보호되므로 허용, 하지만 로그 남김
-    logger.info(f"Dashboard access by {credentials.username} (ALLOWED_USER_IDS 기반, 127.0.0.1 바인딩으로 보호)")
+
+    if not dashboard_user or not dashboard_pass:
+        logger.error("⛔ DASHBOARD_USERNAME/PASSWORD 미설정 -> 대시보드 접근 거부 (fail-closed)")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Dashboard credentials not configured (set DASHBOARD_USERNAME/PASSWORD)",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+
+    is_user_ok = secrets.compare_digest(credentials.username, dashboard_user)
+    is_pass_ok = secrets.compare_digest(credentials.password, dashboard_pass)
+    if not (is_user_ok and is_pass_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
     return credentials.username
 
 # 선택적 인증: 쿼리 파라미터나 헤더로도 인증 가능하도록
@@ -162,6 +178,8 @@ pre{{background:#2a2a2a; padding:12px; border-radius:8px; overflow-x:auto; white
 </div>
 
 <script>
+// SECURITY FIX (2026-09-10 감사): stored-XSS 방지 - 큐/히스토리의 URL은 사용자 입력이므로 이스케이프 후 렌더링
+function esc(s){{ return String(s ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c])); }}
 async function refresh(){{
   try{{
     let r = await fetch('/api/queue');
@@ -170,35 +188,35 @@ async function refresh(){{
     if(j.queued && j.queued.length > 0){{
       html += '<h4>대기 중 (' + j.queued.length + ')</h4>';
       j.queued.forEach(t => {{
-        html += '<div class="badge status-queued">' + t.id + ': ' + (t.url ? t.url.substring(0,50) : 'unknown') + ' (' + t.type + ')</div><br>';
+        html += '<div class="badge status-queued">' + esc(t.id) + ': ' + esc(t.url ? t.url.substring(0,50) : 'unknown') + ' (' + esc(t.type) + ')</div><br>';
       }});
     }}
     if(j.active && j.active.length > 0){{
       html += '<h4>진행 중 (' + j.active.length + ')</h4>';
       j.active.forEach(t => {{
-        html += '<div><span class="badge status-' + t.status + '\">' + t.id + ': ' + t.status + ' ' + (t.progress||0).toFixed(1) + '%</span> ' + (t.url ? t.url.substring(0,40) : '') + '</div>';
-        if(t.progress) html += '<div class="progress"><div class="progress-bar" style="width:' + t.progress + '%"></div></div>';
+        html += '<div><span class="badge status-' + esc(t.status) + '\">' + esc(t.id) + ': ' + esc(t.status) + ' ' + (Number(t.progress)||0).toFixed(1) + '%</span> ' + esc(t.url ? t.url.substring(0,40) : '') + '</div>';
+        if(t.progress) html += '<div class="progress"><div class="progress-bar" style="width:' + (Number(t.progress)||0) + '%"></div></div>';
       }});
     }}
     if(!j.queued?.length && !j.active?.length){{
       html = '<p>큐 비어 있음 - 링크를 추가해보세요!</p>';
-      if(j.message) html += '<p><small>' + j.message + '</small></p>';
+      if(j.message) html += '<p><small>' + esc(j.message) + '</small></p>';
     }}
     document.getElementById('queue').innerHTML = html;
-    
+
     let hr = await fetch('/api/history');
     let hj = await hr.json();
     if(hj.history && hj.history.length > 0){{
       let hhtml = '';
       hj.history.slice(-10).reverse().forEach(h => {{
-        hhtml += '<div class="badge status-' + h.status + '\">' + h.id + ' ' + h.status + '</div> ' + (h.url ? h.url.substring(0,50) : '') + ' <small>(' + (h.type||'') + ')</small><br>';
+        hhtml += '<div class="badge status-' + esc(h.status) + '\">' + esc(h.id) + ' ' + esc(h.status) + '</div> ' + esc(h.url ? h.url.substring(0,50) : '') + ' <small>(' + esc(h.type||'') + ')</small><br>';
       }});
       document.getElementById('history').innerHTML = hhtml;
     }} else {{
       document.getElementById('history').innerHTML = '<p>아직 작업 없음</p>';
     }}
-  }}catch(e){{ 
-    document.getElementById('queue').innerHTML = 'API 연결 실패: ' + e.message; 
+  }}catch(e){{
+    document.getElementById('queue').innerHTML = 'API 연결 실패: ' + esc(e.message);
   }}
 }}
 setInterval(refresh, 3000);
@@ -246,14 +264,16 @@ def get_downloaders():
         download_dir = os.getenv("DOWNLOAD_DIR", "/downloads")
         Path(download_dir).mkdir(parents=True, exist_ok=True)
         
+        max_bytes = _dash_max_bytes()
         downloaders = {}
-        downloaders['http'] = HttpDownloader(download_dir)
+        downloaders['http'] = HttpDownloader(download_dir, max_file_size=max_bytes)
         downloaders['torrent'] = TorrentDownloader(
             download_dir,
             os.getenv("ARIA2_HOST", "http://aria2:6800"),
-            os.getenv("ARIA2_SECRET", "")
+            os.getenv("ARIA2_SECRET", ""),
+            max_file_size=max_bytes,
         )
-        downloaders['ytdlp'] = YtDlpDownloader(download_dir)
+        downloaders['ytdlp'] = YtDlpDownloader(download_dir, max_file_size=max_bytes)
         return downloaders, download_dir
     except Exception as e:
         logger.warning(f"Downloaders 생성 실패: {e}")
@@ -267,7 +287,9 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
     task = next((t for t in download_queue if t['id'] == task_id), None)
     if not task:
         return
-    
+
+    # SECURITY FIX (2026-09-10 감사): 동시 실행 제한 - 무제한 백그라운드 작업 방지
+    await _dash_semaphore.acquire()
     try:
         task['status'] = 'downloading'
         task['progress'] = 0
@@ -345,6 +367,8 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
         download_history.append(task.copy())
         if task in download_queue:
             download_queue.remove(task)
+    finally:
+        _dash_semaphore.release()
 
 @app.get("/", response_class=HTMLResponse)
 def home(username: str = Depends(optional_auth) if REQUIRE_AUTH else None):
@@ -386,7 +410,8 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...), user
         if url.startswith('http'):
             is_safe, reason = _is_safe_url(url)
             if not is_safe:
-                return HTMLResponse(f"<h3>⛔ 차단된 URL (SSRF 방어)</h3><p>{reason}</p><a href='/'>돌아가기</a>", status_code=403)
+                # SECURITY FIX (2026-09-10 감사): XSS 방지 - 사용자 입력 HTML 이스케이프
+                return HTMLResponse(f"<h3>⛔ 차단된 URL (SSRF 방어)</h3><p>{html.escape(reason)}</p><a href='/'>돌아가기</a>", status_code=403)
     except ImportError:
         pass
     
@@ -395,7 +420,8 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...), user
         detected = LinkDetector.detect(url)
         dtype = detected['type']
         if dtype == 'unknown':
-            return HTMLResponse(f"<h3>❌ 알 수 없는 링크: {url[:100]}</h3><p>지원: magnet, torrent, http 직링크, 유튜브 등</p><a href='/'>돌아가기</a>", status_code=400)
+            # SECURITY FIX (2026-09-10 감사): XSS 방지
+            return HTMLResponse(f"<h3>❌ 알 수 없는 링크: {html.escape(url[:100])}</h3><p>지원: magnet, torrent, http 직링크, 유튜브 등</p><a href='/'>돌아가기</a>", status_code=400)
     except Exception as e:
         if url.startswith('magnet:'):
             dtype = 'magnet'
@@ -406,8 +432,18 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...), user
         else:
             dtype = 'unknown'
         if dtype == 'unknown':
-            return HTMLResponse(f"<h3>❌ 알 수 없는 링크</h3><p>오류: {e}</p><a href='/'>돌아가기</a>", status_code=400)
+            # SECURITY FIX (2026-09-10 감사): XSS 방지
+            return HTMLResponse(f"<h3>❌ 알 수 없는 링크</h3><p>오류: {html.escape(str(e))}</p><a href='/'>돌아가기</a>", status_code=400)
     
+    # SECURITY FIX (2026-09-10 감사): 큐 상한 - 무제한 /add로 디스크/CPU 고갈 방지
+    MAX_DASHBOARD_QUEUE = int(os.getenv("DASHBOARD_MAX_QUEUE", "50"))
+    if len(download_queue) >= MAX_DASHBOARD_QUEUE:
+        return HTMLResponse(
+            f"<h3>⏳ 큐가 가득 찼습니다 ({len(download_queue)}/{MAX_DASHBOARD_QUEUE})</h3>"
+            f"<p>진행 중인 작업이 끝난 뒤 다시 시도하세요.</p><a href='/'>돌아가기</a>",
+            status_code=429,
+        )
+
     import uuid
     task_id = str(uuid.uuid4())[:8]
     task = {
@@ -419,15 +455,16 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...), user
         'created_at': __import__('datetime').datetime.now().isoformat()
     }
     download_queue.append(task)
-    
+
     background_tasks.add_task(process_download_task, task_id, url, dtype)
-    
+
+    # SECURITY FIX (2026-09-10 감사): XSS 방지 - URL 이스케이프
     return HTMLResponse(f"""
     <div style="background:#1e1e1e; padding:16px; border-radius:12px; border:1px solid #333">
     <h3>✅ 추가됨!</h3>
     <p>ID: <code>{task_id}</code><br>
-    타입: {dtype}<br>
-    URL: {url[:100]}<br>
+    타입: {html.escape(dtype)}<br>
+    URL: {html.escape(url[:100])}<br>
     상태: 대기열에 추가됨 - 백그라운드에서 다운로드 & Nextcloud 업로드 중</p>
     <p><a href='/'>대시보드로 돌아가기</a> - 3초마다 자동 갱신됩니다</p>
     </div>
@@ -466,8 +503,23 @@ def api_status(username: str = Depends(optional_auth) if REQUIRE_AUTH else None)
 
 if __name__ == "__main__":
     import uvicorn
+    # SECURITY FIX (2026-09-10 감사): 바인드 주소 fail-closed.
+    # - 기존: 주석/로그는 "127.0.0.1 only"라면서 실제로는 0.0.0.0 바인드.
+    # - 수정: 기본 127.0.0.1. 0.0.0.0로 열려면 인증 계정 필수, 없으면 시작 거부.
+    dash_host = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    try:
+        dash_port = int(os.getenv("DASHBOARD_PORT", "8000"))
+    except ValueError:
+        dash_port = 8000
+    dash_user = os.getenv("DASHBOARD_USERNAME", "").strip()
+    dash_pass = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    if dash_host == "0.0.0.0" and REQUIRE_AUTH and (not dash_user or not dash_pass):
+        raise SystemExit(
+            "⛔ SECURITY: DASHBOARD_HOST=0.0.0.0 인데 DASHBOARD_USERNAME/PASSWORD가 없습니다. "
+            "외부 노출 시 인증 계정이 필수입니다. 시작을 거부합니다."
+        )
     print(f"📁 Project root: {project_root}")
     print(f"📄 .env loaded: {bool(os.getenv('NEXTCLOUD_URL'))}")
     print(f"🔒 Auth required: {REQUIRE_AUTH} (DASHBOARD_USERNAME/PASSWORD 설정 권장)")
-    print(f"🌐 Dashboard: http://127.0.0.1:8000 (127.0.0.1 only, 외부 노출 시 인증 필수)")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    print(f"🌐 Dashboard: http://{dash_host}:{dash_port} (기본 127.0.0.1, 외부 노출 시 인증 필수)")
+    uvicorn.run(app, host=dash_host, port=dash_port)

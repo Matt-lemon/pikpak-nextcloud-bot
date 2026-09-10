@@ -175,6 +175,12 @@ def restore_file(manifest_path: str | Path = None, chunks_dir: str | Path = None
         manifest_path = manifests[0]
     
     manifest_path = Path(manifest_path)
+    # SECURITY FIX (2026-09-10 감사): manifest 크기 상한 (거대 JSON 메모리 고갈 방지).
+    # 정상 manifest는 수 KB 수준. 공격자가 GB급 .json을 업로드하면
+    # 자동 복원 스캔 시 json.load에서 메모리 고갈.
+    MAX_MANIFEST_BYTES = 10 * 1024 * 1024  # 10MB
+    if manifest_path.stat().st_size > MAX_MANIFEST_BYTES:
+        raise ValueError(f"Manifest가 너무 큼: {manifest_path.stat().st_size} bytes (최대 {MAX_MANIFEST_BYTES})")
     with open(manifest_path, 'r', encoding='utf-8') as f:
         manifest = json.load(f)
     

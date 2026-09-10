@@ -11,7 +11,9 @@ echo ""
 
 # 폴더 생성
 mkdir -p downloads aria2-config logs
-chmod 777 downloads
+# SECURITY: 777 대신 755 (누구나 쓰기 가능 상태 방지)
+# Docker 볼륨 권한 문제가 생기면 소유자만 조정: sudo chown -R $(id -u):$(id -g) downloads
+chmod 755 downloads aria2-config logs
 
 # .env 체크
 if [ ! -f .env ]; then

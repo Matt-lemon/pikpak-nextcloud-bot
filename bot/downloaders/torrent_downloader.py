@@ -42,7 +42,17 @@ class TorrentDownloader:
         """마그넷/토렌트 다운로드 후 파일 경로 반환 - 크기 사전 검사 포함"""
         if not self.client:
             raise Exception("Aria2 not available. Docker에서 aria2 서비스를 실행하세요.")
-        
+
+        # SECURITY FIX (2026-09-10 감사): .torrent 직링크도 SSRF 검사.
+        # - 기존: add_uris()로 검증 없이 aria2가 URL fetch -> 내부 URL 내용을
+        #   다운로드 -> Nextcloud 업로드 -> 공유링크로 유출 가능했음.
+        #   (예: http://내부호스트/...?x=.torrent 로 끝나는 URL)
+        if magnet_or_url.startswith(('http://', 'https://')):
+            from .http_downloader import is_safe_url as _check_url
+            ok, reason = _check_url(magnet_or_url)
+            if not ok:
+                raise Exception(f"⛔ 차단된 URL (SSRF 방어): {reason}")
+
         effective_max = max_file_size or self.max_file_size
         if effective_max is None:
             try:
@@ -68,7 +78,22 @@ class TorrentDownloader:
             raise
 
         logger.info(f"Aria2 added: {download.gid} - {magnet_or_url[:100]}")
-        
+
+        # SECURITY FIX (2026-09-10 감사): 무한 대기 방지.
+        # - 기존: while True 무한 폴링 -> 시드 없는 토렌트가 세마포어 슬롯을
+        #   영원히 점유, 3개만 쌓여도 봇 전체가 멈춤 (DoS).
+        # - 수정: 전체 제한 + 진행 정체(stall) 제한, 초과 시 중단·삭제.
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, default))
+            except (TypeError, ValueError):
+                return default
+        timeout_hours = _env_float("TORRENT_TIMEOUT_HOURS", 24.0)
+        stall_minutes = _env_float("TORRENT_STALL_MINUTES", 60.0)
+        started_at = time.time()
+        last_progress_at = started_at
+        last_completed = 0
+
         last_update = 0
         size_checked = False
         while True:
@@ -80,10 +105,28 @@ class TorrentDownloader:
                 download = next((d for d in downloads if d.gid == download.gid), None)
                 if not download:
                     raise Exception("Download not found in aria2")
-            
+
             status = download.status
             completed = download.completed_length
             total = download.total_length
+
+            # 진행 감시 (active/seeding 상태가 아니어도 시간은 재야 함)
+            now = time.time()
+            if completed > last_completed:
+                last_completed = completed
+                last_progress_at = now
+            if now - started_at > timeout_hours * 3600:
+                try:
+                    self.client.remove([download], force=True, files=True)
+                except Exception:
+                    pass
+                raise Exception(f"토렌트 제한 시간 초과 ({timeout_hours}시간) - 중단 및 삭제됨")
+            if now - last_progress_at > stall_minutes * 60:
+                try:
+                    self.client.remove([download], force=True, files=True)
+                except Exception:
+                    pass
+                raise Exception(f"토렌트 진행 정체 ({stall_minutes}분간 0 bytes) - 중단 및 삭제됨")
             
             # SECURITY FIX: 크기 사전 검사 - total_length가 알려지는 순간 검사 (디스크 고갈 방지)
             # 기존: 다운로드 완료 후 검사 -> 300GB 토렌트면 300GB 소비 후 실패
@@ -113,7 +156,7 @@ class TorrentDownloader:
                     files = sorted(download.files, key=lambda f: f.length, reverse=True)
                     main_file = Path(files[0].path)
                     logger.info(f"Torrent complete: {main_file}")
-                    
+
                     # 완료 후에도 크기 재검사
                     if effective_max:
                         total_size = sum(f.length for f in download.files)
@@ -125,13 +168,26 @@ class TorrentDownloader:
                             except:
                                 pass
                             raise Exception(f"토렌트 완료 후 크기 초과: {total_size} > {effective_max} - 삭제됨")
-                    
+
                     if len(files) == 1:
-                        return main_file
+                        result_path = main_file
                     else:
-                        return Path(download.dir) / download.name
+                        result_path = Path(download.dir) / download.name
                 else:
-                    return Path(download.dir) / download.name
+                    result_path = Path(download.dir) / download.name
+
+                # SECURITY FIX (2026-09-10 감사): 완료 후 시딩 일시정지.
+                # - 기존: 완료된 작업이 aria2에 계속 남아 무제한 시딩 + 목록 무한 증가.
+                #   (config의 seed_time: 0은 코드에서 전혀 읽지 않았음)
+                # - 수정: 완료 즉시 pause()로 시딩 중단 (파일은 유지).
+                #   시딩을 원하면 aria2 UI/클라이언트에서 직접 resume.
+                try:
+                    download.pause()
+                    logger.info(f"Torrent paused after complete (seeding stopped): {download.gid}")
+                except Exception as e:
+                    logger.debug(f"Pause after complete failed (무시): {e}")
+
+                return result_path
             
             elif status == "error":
                 raise Exception(f"Aria2 error: {download.error_message}")

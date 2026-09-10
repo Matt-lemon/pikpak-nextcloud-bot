@@ -1,8 +1,10 @@
 import yt_dlp
+import itertools
 import logging
 from pathlib import Path
 import asyncio
 import os
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +29,21 @@ class YtDlpDownloader:
         return await loop.run_in_executor(None, self._sync_download, url, progress_callback, effective_max)
 
     def _sync_download(self, url: str, progress_callback=None, max_file_size: int = None) -> Path:
+        # SECURITY FIX (2026-09-10 감사): yt-dlp URL도 SSRF 검사 (방어 심화).
+        # LinkDetector는 공개 도메인만 ytdlp로 보내지만, 직접 호출 경로를 대비.
+        if url.startswith(('http://', 'https://')):
+            from .http_downloader import is_safe_url as _check_url
+            ok, reason = _check_url(url)
+            if not ok:
+                raise Exception(f"⛔ 차단된 URL (SSRF 방어): {reason}")
+
+        # SECURITY FIX (2026-09-10 감사): 작업별 격리 폴더.
+        # - 기존: 모든 작업이 download_dir에 직접 저장 + "최근 mp4" fallback 탐색 ->
+        #   동시 다운로드 시 다른 작업의 파일을 반환/업로드할 수 있었음.
+        # - 수정: 작업마다 고유 폴더 사용, 모든 탐색을 이 폴더로 한정.
+        task_dir = self.download_dir / f"ytdlp_{uuid.uuid4().hex[:12]}"
+        task_dir.mkdir(parents=True, exist_ok=True)
+
         downloaded_files = []
         final_filepath = None
 
@@ -69,30 +86,35 @@ class YtDlpDownloader:
                 with yt_dlp.YoutubeDL(ydl_opts_precheck) as ydl:
                     info = ydl.extract_info(url, download=False)
                     # 단일 영상 또는 플레이리스트
+                    # SECURITY FIX (2026-09-10 감사): entries는 lazy generator일 수 있어
+                    # list()로 전부 풀면 수천 개 영상의 메타데이터를 가져오며 DoS.
+                    # islice로 최대 12개까지만 소비.
                     entries = []
+                    entry_count_probe = 0
                     if 'entries' in info:
-                        entries = list(info['entries'])[:5]  # 처음 5개만 검사 (플레이리스트면)
+                        entries = list(itertools.islice(info['entries'], 12))
+                        entry_count_probe = len(entries)
                     else:
                         entries = [info]
-                    
+
                     for entry in entries:
                         # filesize 또는 filesize_approx 확인
                         fs = entry.get('filesize') or entry.get('filesize_approx') or 0
                         if fs and fs > max_file_size:
                             raise Exception(f"파일 크기 {fs} bytes가 최대 허용 {max_file_size} bytes를 초과합니다 (사전 검사)")
-                        
+
                         # requested_formats에서도 확인
                         for fmt in entry.get('requested_formats', []) or []:
                             ffs = fmt.get('filesize') or fmt.get('filesize_approx') or 0
                             if ffs and ffs > max_file_size:
                                 raise Exception(f"포맷 크기 {ffs} bytes가 최대 허용 {max_file_size} bytes 초과")
-                    
+
                     # 플레이리스트면 전체 크기 추정
                     if 'entries' in info and len(entries) > 1:
                         # 플레이리스트는 기본 차단 (noplaylist=True면 여기 안 옴)
                         # 만약 noplaylist=False로 허용된 경우, 개수 제한
-                        if len(list(info['entries'])) > 10:
-                            raise Exception(f"플레이리스트에 영상이 너무 많습니다 ({len(list(info['entries']))}개) - noplaylist=True 권장")
+                        if entry_count_probe > 10:
+                            raise Exception(f"플레이리스트에 영상이 너무 많습니다 (10개 초과) - noplaylist=True 권장")
             except Exception as e:
                 if "최대 허용" in str(e) or "너무 많" in str(e):
                     raise  # 크기 초과는 그대로 raise
@@ -101,7 +123,7 @@ class YtDlpDownloader:
 
         ydl_opts = {
             'format': self.format_str,
-            'outtmpl': str(self.download_dir / '%(title)s [%(id)s].%(ext)s'),
+            'outtmpl': str(task_dir / '%(title)s [%(id)s].%(ext)s'),
             'merge_output_format': 'mp4',
             'noplaylist': no_playlist,  # SECURITY FIX: 기본 True
             'progress_hooks': [hook],
@@ -155,7 +177,7 @@ class YtDlpDownloader:
             
             video_id = info.get('id', '')
             if video_id:
-                mp4_files = list(self.download_dir.glob(f"*[{video_id}].mp4"))
+                mp4_files = list(task_dir.glob(f"*[{video_id}].mp4"))
                 if mp4_files:
                     latest = max(mp4_files, key=lambda x: x.stat().st_mtime)
                     if latest.exists():
@@ -174,7 +196,7 @@ class YtDlpDownloader:
                 logger.info(f"yt-dlp final file from existing downloaded_files: {latest}")
                 return latest
             
-            mp4_files = sorted(self.download_dir.glob('*.mp4'), key=lambda x: x.stat().st_mtime, reverse=True)
+            mp4_files = sorted(task_dir.glob('*.mp4'), key=lambda x: x.stat().st_mtime, reverse=True)
             if mp4_files and mp4_files[0].exists():
                 import time
                 if time.time() - mp4_files[0].stat().st_mtime < 60:
@@ -184,7 +206,7 @@ class YtDlpDownloader:
                     logger.info(f"yt-dlp final file from recent mp4: {mp4_files[0]}")
                     return mp4_files[0]
             
-            all_files = sorted(self.download_dir.glob('*'), key=lambda x: x.stat().st_mtime, reverse=True)
+            all_files = sorted(task_dir.glob('*'), key=lambda x: x.stat().st_mtime, reverse=True)
             for f in all_files:
                 if f.is_file() and f.stat().st_size > 0:
                     if not f.name.endswith(('.part', '.ytdl', '.temp')):

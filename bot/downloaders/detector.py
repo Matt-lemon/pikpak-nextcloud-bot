@@ -35,8 +35,10 @@ class LinkDetector:
                 return {"type": "torrent_url", "url": text, "name": Path(path).name}
             
             # yt-dlp 대상
+            # SECURITY FIX (2026-09-10 감사): substring 매칭 -> 정확한 도메인 매칭.
+            # 기존: 'evilyoutube.com'도 'youtube.com'을 포함하므로 ytdlp로 분류됨.
             for d in LinkDetector.YTDLP_DOMAINS:
-                if d in domain:
+                if domain == d or domain.endswith('.' + d):
                     return {"type": "ytdlp", "url": text, "name": "video"}
             
             # 일반 직링크

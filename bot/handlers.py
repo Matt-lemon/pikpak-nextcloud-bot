@@ -11,7 +11,7 @@ from telegram.constants import ParseMode
 from .downloaders import LinkDetector, HttpDownloader, TorrentDownloader, YtDlpDownloader
 from .nextcloud import NextcloudClient
 from .queue_manager import QueueManager, DownloadTask
-from .utils import format_size, format_speed, progress_bar, get_files_recursive
+from .utils import format_size, format_speed, progress_bar, get_files_recursive, sanitize_filename, safe_join
 from .utils.file_splitter import CHUNK_SIZE as SPLIT_CHUNK_SIZE
 
 # 대용량 파일 분할 전송 통합 (선택적)
@@ -236,6 +236,11 @@ def _check_file_size_allowed(file_size: int) -> tuple[bool, str]:
     return True, ""
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # SECURITY FIX (2026-09-10 감사): /start도 권한 검사.
+    # 기존: 누구나 설정값(최대크기, 경로 등) 조회 가능 + 봇 존재 노출.
+    if not check_permission(update.effective_user.id):
+        await update.message.reply_text("⛔ 권한이 없습니다.")
+        return
     max_gb = CONFIG.get('bot', {}).get('max_file_size_gb', 20)
     share_enabled = CONFIG.get('_create_share_link', True)
     text = f"""
@@ -304,13 +309,27 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     download_dir = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
-    
+
     # 인자 확인: /merge [폴더명]
+    # SECURITY FIX (2026-09-10 감사): /merge 경로 탈출 차단.
+    # - 기존: download_dir / args 그대로 사용 + 절대경로 폴백까지 허용 ->
+    #   '/merge ../../etc' 등으로 임의 폴더를 읽고, 복원 결과물을 임의 경로에
+    #   쓰고, Nextcloud로 업로드할 수 있었음.
+    # - 수정: DOWNLOAD_DIR 내부만 허용.
     target_dir = download_dir
     if context.args:
-        target_dir = download_dir / " ".join(context.args)
-        if not target_dir.exists():
-            target_dir = Path(" ".join(context.args))
+        try:
+            target_dir = safe_join(download_dir, " ".join(context.args))
+        except ValueError:
+            logger.warning(f"⛔ SECURITY: /merge 외부 경로 차단: {' '.join(context.args)} (사용자: {update.effective_user.id})")
+            await update.message.reply_text(
+                f"⛔ **보안 차단**\n다운로드 폴더(`{download_dir}`) 내부 경로만 지정할 수 있습니다.",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        if not target_dir.exists() or not target_dir.is_dir():
+            await update.message.reply_text(f"❌ 폴더를 찾을 수 없습니다: `{target_dir}`", parse_mode=ParseMode.MARKDOWN)
+            return
     
     await update.message.reply_text(f"🔍 분할 파일 검색 중: `{target_dir}`", parse_mode=ParseMode.MARKDOWN)
     
@@ -478,16 +497,34 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not local_path.exists():
             # Nextcloud 경로로 간주 - WebDAV 다운로드 구현
             is_nextcloud_path = True
-            # 경로 정규화: /PikPakBot/... 또는 PikPakBot/... 모두 처리
-            # base_path가 이미 포함되어 있을 수도 있고 아닐 수도 있음
-            if file_path_str.startswith('/'):
-                remote_path_for_download = file_path_str.strip('/')
+            # SECURITY FIX (2026-09-10 감사): Nextcloud 경로를 base_path 내부로 제한.
+            # - 기존: '/sendlarge /다른폴더/비밀파일'로 봇 계정이 볼 수 있는 *모든*
+            #   Nextcloud 파일을 다운로드→텔레그램 전송 가능 (허용된 사용자끼리도
+            #   서로의 폴더를 읽을 수 있음).
+            # - 수정: base_path(/PikPakBot) 내부만 허용. 파일명만 주면 base 기준 해석.
+            nc_base = (nc_client.base_path or "").strip('/')
+            remote_norm = '/'.join(
+                p for p in file_path_str.strip('/').split('/') if p not in ('', '.', '..')
+            )
+            if '/' in file_path_str.strip('/'):
+                # 경로 형태 입력: base_path 내부인지 강제
+                if nc_base and not (remote_norm == nc_base or remote_norm.startswith(nc_base + '/')):
+                    logger.warning(f"⛔ SECURITY: /sendlarge Nextcloud 범위 외 차단: {file_path_str} (사용자: {update.effective_user.id})")
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=status_msg.message_id,
+                        text=f"⛔ **보안 차단**\n"
+                             f"`/{nc_base}/` 내부 경로만 전송할 수 있습니다.\n"
+                             f"입력: `{file_path_str}`",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    return
+                remote_path_for_download = remote_norm
             else:
-                remote_path_for_download = file_path_str.strip('/')
-            
-            # 만약 base_path로 시작하지 않으면 base_path 없이도 시도
-            # 실제 Nextcloud 경로는 base_path를 포함해야 함
-            filename = Path(file_path_str).name
+                # 파일명만 입력: base_path 기준 상대경로로 해석
+                remote_path_for_download = f"{nc_base}/{remote_norm}" if nc_base else remote_norm
+
+            filename = sanitize_filename(Path(file_path_str).name, default="sendlarge_file")
             local_path = download_dir / filename
             
             # 중복 방지
@@ -804,7 +841,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE, is
             return
         file = await context.bot.get_file(doc.file_id, read_timeout=7200, write_timeout=7200, connect_timeout=60, pool_timeout=60)
         download_dir = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
-        torrent_path = download_dir / file_name
+        # SECURITY FIX (2026-09-10 감사): Telegram file_name은 송신자가 임의 지정
+        # 가능 -> '../../x' 또는 절대경로가 오면 임의 경로 쓰기. sanitize + containment.
+        file_name = sanitize_filename(file_name, default="file.torrent")
+        if not file_name.lower().endswith('.torrent'):
+            file_name += '.torrent'  # sanitize로 확장자가 날아간 경우 복원 (aria2 분기용)
+        try:
+            torrent_path = safe_join(download_dir, file_name)
+        except ValueError as e:
+            logger.warning(f"⛔ SECURITY: 토렌트 파일명 경로 탈출 차단: {e} (사용자: {update.effective_user.id})")
+            await update.message.reply_text("⛔ 파일명에 허용되지 않는 경로가 포함되어 있습니다.")
+            return
         await file.download_to_drive(torrent_path)
         detected = {"type": "torrent_file", "url": str(torrent_path), "name": file_name}
         await process_single_link(str(torrent_path), update, context, detected)
@@ -907,14 +954,32 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
         tg_file = await context.bot.get_file(file_id, read_timeout=7200, write_timeout=7200, connect_timeout=60, pool_timeout=60)
         download_dir = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
         download_dir.mkdir(parents=True, exist_ok=True)
-        
-        local_path = download_dir / file_name
+
+        # SECURITY FIX (2026-09-10 감사): file_name Path Traversal 차단.
+        # video/audio/file_name 등은 송신 클라이언트가 임의 지정 가능.
+        # 기존: download_dir / file_name -> '../../..' 또는 절대경로로 임의 쓰기.
+        file_name = sanitize_filename(file_name, default=f"{media_type}_file")
+        try:
+            local_path = safe_join(download_dir, file_name)
+        except ValueError as e:
+            logger.warning(f"⛔ SECURITY: 미디어 파일명 경로 탈출 차단: {e} (사용자: {update.effective_user.id})")
+            await update.message.reply_text("⛔ 파일명에 허용되지 않는 경로가 포함되어 있습니다.")
+            return
+
         counter = 1
         while local_path.exists():
             stem = Path(file_name).stem
             suffix = Path(file_name).suffix
-            local_path = download_dir / f"{stem}_{counter}{suffix}"
+            # sanitize된 이름 기반이므로 경로 탈출 불가, 그래도 safe_join으로 재확인
+            try:
+                local_path = safe_join(download_dir, f"{stem}_{counter}{suffix}")
+            except ValueError:
+                local_path = safe_join(download_dir, f"{media_type}_{uuid.uuid4().hex[:8]}{suffix}")
+                break
             counter += 1
+            if counter > 1000:  # 무한 루프 방지
+                local_path = safe_join(download_dir, f"{media_type}_{uuid.uuid4().hex[:8]}{suffix}")
+                break
         
         bot_api_file_path = None
         if hasattr(tg_file, 'file_path') and tg_file.file_path:

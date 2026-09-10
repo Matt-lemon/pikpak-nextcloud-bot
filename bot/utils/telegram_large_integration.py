@@ -167,6 +167,10 @@ def check_and_merge_parts(chunks_dir: str | Path, auto_cleanup: bool = False) ->
     
     for manifest_path in manifests:
         try:
+            # SECURITY FIX (2026-09-10 감사): 자동 스캔 시 거대 JSON 차단 (10MB 상한)
+            if manifest_path.stat().st_size > 10 * 1024 * 1024:
+                logger.warning(f"자동 복원 스킵 (manifest 과대): {manifest_path}")
+                continue
             with open(manifest_path, 'r', encoding='utf-8') as f:
                 manifest = json.load(f)
             

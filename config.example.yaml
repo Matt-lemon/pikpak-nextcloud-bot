@@ -31,12 +31,12 @@ notifications:
   send_thumbnail: true
 
 # 빈 폴더 일일 정리 (PikPakBot 하위 재귀 스캔, bottom-up 삭제)
-# 기본 OFF (opt-in): cleanup.enabled: true를 명시해야 자동 실행됩니다.
-# 텔레그램에서도 전환 가능: /cleanup_on · /cleanup_off (상태는 ./data/cleanup_state.json에 저장,
-# 텔레그램 토글이 config.enabled보다 우선)
+# 기본 OFF (opt-in): 자동 실행하려면 cleanup.enabled: true 또는 텔레그램 /cleanup_on
+# 텔레그램 전환: /cleanup_on · /cleanup_off (상태는 ./data/cleanup_state.json에 저장,
+# 텔레그램 토글이 config.enabled보다 우선, 상태 파일 손상 시 자동 OFF)
 # 수동 /cleanup 명령어는 항상 사용 가능하며 enabled와 무관하게 동작합니다.
 cleanup:
-  enabled: true    # true를 명시한 사용자만 매일 자동 실행 (파일 삭제 기능은 기본 OFF)
+  enabled: false   # 기본 OFF. 자동 실행을 원하면 true 또는 /cleanup_on
   hour: 4          # 매일 실행 시각 (서버 로컬 시간)
   minute: 0
   min_age_hours: 24  # 이보다 최근에 변경된 폴더는 보호 (수정시각 없으면 보존)

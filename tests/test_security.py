@@ -194,6 +194,29 @@ class TestTorrentRouting:
         self._run_download("https://example.com/file.torrent#frag")
 
 
+class TestMarkdownSafety:
+    """ROUND-5 회귀: 텔레그램 Markdown 파싱 파괴 방지.
+    실측 사례: '타입: torrent_url'의 _가 이탤릭으로 파싱되어
+    'Can't parse entities at byte offset 56' 발생."""
+
+    def _handlers_src(self):
+        return (ROOT / "bot" / "handlers.py").read_text(encoding="utf-8")
+
+    def test_type_values_are_codespanned(self):
+        import re
+        src = self._handlers_src()
+        bad = re.findall(r"타입: \{", src)
+        assert not bad, f"백틱 없는 타입 삽입 발견: {bad}"
+
+    def test_no_literal_backslash_n(self):
+        src = self._handlers_src()
+        # "\\n"(백슬래시 2개+n) 리터럴이 있으면 개행 대신 문자 그대로 표시됨
+        assert "\\\\n" not in src, "리터럴 \\\\n 발견 (개행 오타)"
+
+    def test_sanitize_strips_backtick(self):
+        assert sanitize_filename("a`b.mp4") == "a'b.mp4"
+
+
 class TestPTBStreaming:
     def test_inputfile_takes_open_handle(self):
         """read_file_handle=False에는 열린 핸들을 전달해야 스트리밍됨 (PTB>=21.5)."""

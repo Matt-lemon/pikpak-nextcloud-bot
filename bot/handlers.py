@@ -159,6 +159,10 @@ def init_managers(config):
     
     logger.info(f"✅ Config applied: max_file={max_file_gb}GB, share_link={create_share}, date_folder={CONFIG['_auto_date_folder']}, progress_every={CONFIG['_progress_every']}%")
 
+def _code(value) -> str:
+    """Markdown 코드스팬에 넣는 값 정화 (백틱 무력화). ROUND-5"""
+    return str(value).replace("`", "'")
+
 def check_permission(user_id: int) -> bool:
     """
     SECURITY FIX: ALLOWED_USER_IDS가 비어있으면 기본적으로 거부
@@ -442,10 +446,10 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         if not target_dir.exists() or not target_dir.is_dir():
-            await update.message.reply_text(f"❌ 폴더를 찾을 수 없습니다: `{target_dir}`", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"❌ 폴더를 찾을 수 없습니다: `{_code(target_dir)}`", parse_mode=ParseMode.MARKDOWN)
             return
     
-    await update.message.reply_text(f"🔍 분할 파일 검색 중: `{target_dir}`", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text(f"🔍 분할 파일 검색 중: `{_code(target_dir)}`", parse_mode=ParseMode.MARKDOWN)
     
     try:
         from .utils.file_splitter import restore_file
@@ -458,7 +462,7 @@ async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not manifests and not part_files:
             await update.message.reply_text(
                 f"❌ 분할 파일을 찾을 수 없습니다.\n"
-                f"폴더: `{target_dir}`\n"
+                f"폴더: `{_code(target_dir)}`\n"
                 f"필요: `*.part_*` 또는 `*.tgparts.json` 파일",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -1056,7 +1060,8 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
         forward_tag = " [전달됨]" if is_forwarded else ""
         status_msg = await update.message.reply_text(
             f"📥 **텔레그램 파일 수신{forward_tag}**\n"
-            f"타입: {media_type}\n"
+            # ROUND-5 FIX: 타입값을 백틱으로 감쌈 (video_note 등의 _가 Markdown 엔티티로 파싱되어 BadRequest)
+            f"타입: `{media_type}`\n"
             f"파일: `{file_name}`\n"
             f"크기: {format_size(file_size) if file_size else '알 수 없음'}\n"
             f"상태: Telegram에서 다운로드 중...",
@@ -1154,7 +1159,7 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
 
         result_text = (
             f"✅ **완료!{forward_tag}**\n"
-            f"타입: {media_type}\n"
+            f"타입: `{media_type}`\n"
             f"파일: `{local_path.name}` ({format_size(local_path.stat().st_size)})\n\n"
             f"**Nextcloud 저장 위치:**\n"
             f"`{base_remote}`\n\n"
@@ -1282,8 +1287,8 @@ async def process_single_link(url: str, update: Update, context: ContextTypes.DE
     status_msg = await update.message.reply_text(
         f"📥 **대기열 추가**\n"
         f"ID: `{task_id}`\n"
-        f"타입: {detected['type']}\n"
-        f"링크: `{url[:80]}...`\\n"
+        f"타입: `{detected['type']}`\n"
+        f"링크: `{url[:80]}...`\n"
         f"상태: 대기 중...",
         parse_mode=ParseMode.MARKDOWN
     )
@@ -1325,7 +1330,7 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
                     message_id=task.message_id,
                     text=f"⬇️ **다운로드 중**\n"
                          f"ID: `{task.id}`\n"
-                         f"타입: {task.type}\n"
+                         f"타입: `{task.type}`\n"
                          f"{bar}\n"
                          f"{format_size(current)} / {format_size(total)} {speed_text}\n"
                          f"상태: {status_msg or task.status}",
@@ -1436,9 +1441,10 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
 
         # 3. 완료 메시지
         task.status = "completed"
-        result_text = f"✅ **완료!**\nID: `{task.id}`\n타입: {task.type}\n\n**Nextcloud 저장 위치:**\n`{base_remote}`\n\n"
+        result_text = f"✅ **완료!**\nID: `{task.id}`\n타입: `{task.type}`\n\n**Nextcloud 저장 위치:**\n`{base_remote}`\n\n"
         for remote_path, share_url, size in uploaded_links[:5]:
-            result_text += f"📄 {Path(remote_path).name} ({format_size(size)})\n🔗 {share_url}\n\n"
+            # ROUND-5 FIX: 파일명도 백틱 처리 (이름 속 _ * 등이 Markdown 파괴 방지)
+            result_text += f"📄 `{Path(remote_path).name}` ({format_size(size)})\n🔗 {share_url}\n\n"
         if len(uploaded_links) > 5:
             result_text += f"... 외 {len(uploaded_links)-5}개 파일\n"
 

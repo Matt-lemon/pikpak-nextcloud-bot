@@ -47,6 +47,8 @@ def sanitize_filename(name: str, default: str = "file") -> str:
         name = ""
     # NUL 바이트 및 제어문자 제거 (CRLF 포함 - 로그/메시지 인젝션 방지)
     name = "".join(c for c in name if c != "\x00" and ord(c) >= 32)
+    # ROUND-5: 백틱 무력화 (텔레그램 Markdown 코드스팬 파괴 방지)
+    name = name.replace("`", "'")
     # 디렉토리 성분 제거 (POSIX + Windows 구분자 모두 처리)
     # 주의: PurePosixPath.name은 백슬래시를 구분자로 보지 않으므로 수동 처리
     name = name.replace("\\", "/")

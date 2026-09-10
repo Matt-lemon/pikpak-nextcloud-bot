@@ -2,7 +2,7 @@ import os
 import requests
 from pathlib import Path
 import xml.etree.ElementTree as ET
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 import logging
 import aiofiles
 import asyncio
@@ -228,6 +228,73 @@ class NextcloudClient:
         url = f"{self.webdav_url}/{encoded}"
         resp = self.session.request("PROPFIND", url, headers={"Depth": "1"}, timeout=self.timeout)
         return resp.text
+
+    def list_dir(self, remote_path: str = "") -> list:
+        """PROPFIND Depth:1 결과를 파싱해서 항목 리스트 반환.
+
+        ROUND-6: /list 가독성 개선. XML 원문 대신 구조화된 목록 제공.
+        Returns: [{'name': str, 'is_dir': bool, 'size': int, 'modified': str}]
+                 (폴더 먼저, 이름순 정렬. 자기 자신 항목 제외)
+        """
+        remote_path = remote_path.strip('/')
+        encoded = self._encode_path(remote_path)
+        url = f"{self.webdav_url}/{encoded}"
+        resp = self.session.request("PROPFIND", url, headers={"Depth": "1"}, timeout=self.timeout)
+        if resp.status_code not in (200, 207):
+            raise Exception(f"목록 조회 실패: HTTP {resp.status_code}")
+        try:
+            root = ET.fromstring(resp.text)
+        except ET.ParseError:
+            raise Exception("목록 파싱 실패 (WebDAV 응답이 XML이 아님)")
+
+        def _local(tag: str) -> str:
+            return tag.rsplit('}', 1)[-1]
+
+        entries = []
+        responses = [el for el in root.iter() if _local(el.tag) == 'response']
+        for idx, r in enumerate(responses):
+            href_el = next((c for c in r if _local(c.tag) == 'href'), None)
+            if href_el is None or not (href_el.text or '').strip():
+                continue
+            href_path = unquote(urlparse(href_el.text.strip()).path)
+
+            if '/files/' in href_path:
+                # 표준 형태: /remote.php/dav/files/<user>/<path>
+                rel = href_path.split('/files/', 1)[1]
+                segs = [s for s in rel.strip('/').split('/') if s]
+                rel = '/'.join(segs[1:]) if len(segs) > 1 else ''
+                if rel == remote_path:
+                    continue  # 자기 자신
+                name = rel.rsplit('/', 1)[-1] if rel else ''
+            else:
+                # 비표준 응답: 관례상 첫 항목이 자기 자신
+                if idx == 0:
+                    continue
+                name = href_path.strip('/').rsplit('/', 1)[-1]
+            if not name:
+                continue
+
+            prop = next((c for c in r.iter() if _local(c.tag) == 'prop'), None)
+            is_dir, size, modified = False, 0, ''
+            if prop is not None:
+                rt = next((c for c in prop if _local(c.tag) == 'resourcetype'), None)
+                if rt is not None:
+                    is_dir = any(_local(c.tag) == 'collection' for c in rt)
+                if is_dir:
+                    q = next((c for c in prop if _local(c.tag) == 'quota-used-bytes'), None)
+                    if q is not None and (q.text or '').strip().isdigit():
+                        size = int(q.text.strip())
+                else:
+                    cl = next((c for c in prop if _local(c.tag) == 'getcontentlength'), None)
+                    if cl is not None and (cl.text or '').strip().isdigit():
+                        size = int(cl.text.strip())
+                lm = next((c for c in prop if _local(c.tag) == 'getlastmodified'), None)
+                if lm is not None and lm.text:
+                    modified = lm.text.strip()
+            entries.append({'name': name, 'is_dir': is_dir, 'size': size, 'modified': modified})
+
+        entries.sort(key=lambda e: (not e['is_dir'], e['name'].lower()))
+        return entries
 
     def get_quota(self):
         try:

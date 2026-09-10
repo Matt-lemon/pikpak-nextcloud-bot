@@ -217,6 +217,123 @@ class TestMarkdownSafety:
         assert sanitize_filename("a`b.mp4") == "a'b.mp4"
 
 
+PROPFIND_SAMPLE = """<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:s="http://sabredav.org/ns">
+ <d:response>
+  <d:href>/remote.php/dav/files/mir2mix/PikPakBot/</d:href>
+  <d:propstat><d:prop>
+   <d:resourcetype><d:collection/></d:resourcetype>
+   <d:quota-used-bytes>39</d:quota-used-bytes>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/remote.php/dav/files/mir2mix/PikPakBot/2026-09-10/</d:href>
+  <d:propstat><d:prop>
+   <d:resourcetype><d:collection/></d:resourcetype>
+   <d:quota-used-bytes>2930883868</d:quota-used-bytes>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+ <d:response>
+  <d:href>/remote.php/dav/files/mir2mix/PikPakBot/%EC%98%81%EC%83%81.mp4</d:href>
+  <d:propstat><d:prop>
+   <d:resourcetype/>
+   <d:getcontentlength>1226213048</d:getcontentlength>
+   <d:getlastmodified>Thu, 10 Sep 2026 14:25:06 GMT</d:getlastmodified>
+  </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+ </d:response>
+</d:multistatus>"""
+
+
+class TestPropfindParsing:
+    """ROUND-6: PROPFIND XML 파싱 (실제 Nextcloud 응답 구조 기반 픽스처)."""
+
+    def _client_with(self, status_code, text):
+        from unittest.mock import MagicMock
+        c = NextcloudClient("https://nc.example", "u", "p")
+        fake_resp = MagicMock()
+        fake_resp.status_code = status_code
+        fake_resp.text = text
+        c.session = MagicMock()
+        c.session.request.return_value = fake_resp
+        return c
+
+    def test_parse_entries(self):
+        c = self._client_with(207, PROPFIND_SAMPLE)
+        entries = c.list_dir("PikPakBot")
+        # 자기 자신 제외, 폴더 먼저
+        assert [(e["name"], e["is_dir"]) for e in entries] == [
+            ("2026-09-10", True),
+            ("영상.mp4", False),  # URL 디코딩 확인
+        ]
+        assert entries[0]["size"] == 2930883868  # quota-used-bytes
+        assert entries[1]["size"] == 1226213048  # getcontentlength
+
+    def test_empty_folder(self):
+        only_self = PROPFIND_SAMPLE.split("<d:response>")[0] + "<d:response>" + \
+            PROPFIND_SAMPLE.split("<d:response>")[1].split("</d:response>")[0] + \
+            "</d:response></d:multistatus>"
+        c = self._client_with(207, only_self)
+        assert c.list_dir("PikPakBot") == []
+
+    def test_http_error_raises(self):
+        import pytest
+        c = self._client_with(404, "not found")
+        with pytest.raises(Exception, match="HTTP 404"):
+            c.list_dir("PikPakBot/nope")
+
+
+class TestListContainment:
+    """ROUND-6: /list 하위경로가 base_path를 벗어나지 않는지 검증 (telegram 필요)."""
+
+    def _run_list(self, args):
+        import asyncio
+        import pytest
+        pytest.importorskip("telegram")
+        from unittest.mock import MagicMock, AsyncMock
+        import bot.handlers as H
+
+        captured = {}
+        fake_nc = MagicMock()
+        fake_nc.base_path = "PikPakBot"
+
+        def _list_dir(remote):
+            captured["remote"] = remote
+            return [{"name": "a.mp4", "is_dir": False, "size": 10, "modified": ""}]
+
+        fake_nc.list_dir.side_effect = _list_dir
+        H.nc_client = fake_nc
+        try:
+            update = MagicMock()
+            update.effective_user.id = 1234
+            update.message.reply_text = AsyncMock()
+            context = MagicMock()
+            context.args = args
+            import os
+            old = os.environ.get("ALLOWED_USER_IDS")
+            os.environ["ALLOWED_USER_IDS"] = "1234"
+            try:
+                asyncio.run(H.list_command(update, context))
+            finally:
+                if old is None:
+                    del os.environ["ALLOWED_USER_IDS"]
+                else:
+                    os.environ["ALLOWED_USER_IDS"] = old
+        finally:
+            H.nc_client = None
+        return captured.get("remote"), update.message.reply_text.call_args[0][0]
+
+    def test_subpath(self):
+        remote, text = self._run_list(["2026-09-10"])
+        assert remote == "PikPakBot/2026-09-10"
+        assert "a.mp4" in text
+
+    def test_traversal_blocked(self):
+        remote, _ = self._run_list(["../../etc"])
+        assert remote == "PikPakBot/etc"  # .. 제거되어 base 내부로 강제됨
+        remote, _ = self._run_list(["/etc/passwd"])
+        assert remote == "PikPakBot/etc/passwd"  # 절대경로도 상대경로로 해석
+
+
 class TestPTBStreaming:
     def test_inputfile_takes_open_handle(self):
         """read_file_handle=False에는 열린 핸들을 전달해야 스트리밍됨 (PTB>=21.5)."""

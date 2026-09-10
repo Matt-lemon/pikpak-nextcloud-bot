@@ -411,14 +411,44 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Nextcloud 폴더 목록 - /list [하위경로] (base_path 내부만 허용).
+
+    ROUND-6: XML 원문 대신 파싱된 목록 표시.
+    예: /list, /list 2026-09-10, /list 2026-09-10/forwarded
+    """
     if not check_permission(update.effective_user.id):
         await update.message.reply_text("⛔ 권한이 없습니다.")
         return
     try:
-        files = nc_client.list_files(nc_client.base_path)
-        await update.message.reply_text(f"📁 Nextcloud 파일 목록 (일부):\n{files[:3000]}")
+        base = (nc_client.base_path or "").strip('/')
+        sub = " ".join(context.args or []).strip().strip("/")
+        # base_path 내부로 강제 (.. / . 제거, 절대경로도 상대경로로 해석)
+        parts = [p for p in sub.split("/") if p not in ("", ".", "..")]
+        remote = base + ("/" + "/".join(parts) if parts else "")
+
+        # ROUND-6: 동기 WebDAV 호출을 executor로 (이벤트 루프 블로킹 방지)
+        loop = asyncio.get_event_loop()
+        entries = await loop.run_in_executor(None, lambda: nc_client.list_dir(remote))
+
+        max_entries = 30
+        lines = [f"📁 `{_code('/' + remote + '/')}` ({len(entries)}개)"]
+        if not entries:
+            lines.append("(비어 있음)")
+        for e in entries[:max_entries]:
+            icon = "📁" if e['is_dir'] else "📄"
+            disp = e['name'] + ("/" if e['is_dir'] else "")
+            if e['size'] > 0:
+                lines.append(f"{icon} `{_code(disp)}` ({format_size(e['size'])})")
+            else:
+                lines.append(f"{icon} `{_code(disp)}`")
+        if len(entries) > max_entries:
+            lines.append(f"외 {len(entries) - max_entries}개 더 있음")
+        text = "\n".join(lines)
+        if len(text) > 3500:
+            text = text[:3500] + "\n...(길이 제한으로 잘림)"
+        await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"❌ 목록 조회 실패: {e}")
+        await update.message.reply_text(f"❌ 목록 조회 실패: {str(e)[:300]}")
 
 async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """분할된 파일 자동 복원 명령어"""

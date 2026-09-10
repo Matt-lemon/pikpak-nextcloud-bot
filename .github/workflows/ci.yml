@@ -1,0 +1,35 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # latest + 지원 최소 버전(PTB 21.5) 모두 검증
+        # media_write_timeout/read_file_handle은 21.5부터 존재
+        ptb: ["latest", "21.5"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt pytest
+          if [ "${{ matrix.ptb }}" = "21.5" ]; then
+            pip install "python-telegram-bot==21.5"
+          fi
+          pip freeze | grep -i telegram
+
+      - name: Compile check
+        run: python -m compileall -q bot tools
+
+      - name: Security regression tests
+        run: python -m pytest tests/ -q

@@ -129,7 +129,7 @@ def main():
     
     # 빈 폴더 일일 정리 스케줄러 (매일 로컬 시각 hour:minute 실행)
     async def _daily_cleanup_loop(app):
-        from .maintenance import cleanup_empty_dirs
+        from .maintenance import cleanup_empty_dirs, parse_min_age_hours
         from . import handlers as _h
         while True:
             cfg = config.get("cleanup", {}) or {}
@@ -146,7 +146,7 @@ def main():
             try:
                 stats = await asyncio.to_thread(
                     cleanup_empty_dirs, _h.nc_client, _h.nc_client.base_path,
-                    int(cfg.get("min_age_hours", 24)))
+                    parse_min_age_hours(cfg))
                 logger.info(f"🧹 일일 정리 완료: 검사 {stats['scanned']}, 삭제 {len(stats['deleted'])}, 오류 {len(stats['errors'])}")
                 # 삭제/오류가 있을 때만 첫 허용 사용자에게 알림 (plain text)
                 if (stats["deleted"] or stats["errors"]) and cfg.get("notify", True) and allowed_ids:
@@ -168,8 +168,10 @@ def main():
 
     async def post_init(app):
         cfg = config.get("cleanup", {}) or {}
-        if not cfg.get("enabled", True):
-            logger.info("🧹 빈 폴더 일일 정리: 비활성화됨 (config.yaml cleanup.enabled=false)")
+        # SECURITY: 자동 삭제는 기본 OFF (opt-in). cleanup.enabled: true를
+        # 명시한 사용자에게만 매일 자동 실행됨 (기존 사용자 놀라움 방지).
+        if not cfg.get("enabled", False):
+            logger.info("🧹 빈 폴더 일일 정리: 자동 실행 비활성화 (config.yaml에서 cleanup.enabled: true로 명시해야 활성화)")
             return
         try:
             hour, minute = int(cfg.get("hour", 4)), int(cfg.get("minute", 0))

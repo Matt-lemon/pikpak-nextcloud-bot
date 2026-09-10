@@ -2,7 +2,9 @@
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
 
-from bot.maintenance import cleanup_empty_dirs, _age_ok
+import pytest
+
+from bot.maintenance import cleanup_empty_dirs, _age_ok, parse_min_age_hours
 
 
 def _entry(name, is_dir, modified=""):
@@ -78,7 +80,7 @@ class TestCleanupEmptyDirs:
         c = FakeClient(_tree())
         stats = cleanup_empty_dirs(c, "PikPakBot", min_age_hours=24)
         assert "PikPakBot/recent" not in c.deleted
-        assert stats["skipped_recent"] == 1
+        assert stats["protected"] == 1
 
     def test_verify_before_delete_race(self):
         class RaceClient(FakeClient):
@@ -118,6 +120,53 @@ class TestCleanupEmptyDirs:
         assert "PikPakBot/parent" not in c.deleted
         assert "PikPakBot/empty1" in c.deleted  # 다른 가지는 정상 정리
 
+    def test_scans_empty_child_even_when_parent_has_file(self):
+        # 회귀: 부모에 파일이 있으면 하위 폴더 탐색이 중단되던 버그
+        tree = {
+            "PikPakBot": [
+                _entry("keep.txt", False, OLD),
+                _entry("empty", True, OLD),
+            ],
+            "PikPakBot/empty": [],
+        }
+        c = FakeClient(tree)
+        cleanup_empty_dirs(c, "PikPakBot")
+        assert "PikPakBot/empty" in c.deleted
+        assert "PikPakBot" not in c.deleted
+
+    def test_keeps_parent_with_file_and_child_deleted(self):
+        # 부모에 파일 + 빈 하위폴더가 같이 있으면: 하위는 삭제, 부모는 유지
+        tree = {
+            "PikPakBot": [
+                _entry("video.mp4", False, OLD),
+                _entry("temp", True, OLD),
+            ],
+            "PikPakBot/temp": [],
+        }
+        c = FakeClient(tree)
+        cleanup_empty_dirs(c, "PikPakBot")
+        assert "PikPakBot/temp" in c.deleted
+        assert "PikPakBot" not in c.deleted
+
+    def test_empty_base_raises(self):
+        # 빈 base로 재귀하면 Nextcloud 루트 전체가 탐색 대상이 됨 -> 거부
+        c = FakeClient({})
+        with pytest.raises(ValueError):
+            cleanup_empty_dirs(c, "")
+        with pytest.raises(ValueError):
+            cleanup_empty_dirs(c, "/")
+
+    def test_unknown_mtime_kept_fail_closed(self):
+        # 수정시각이 없는 빈 폴더는 삭제하지 않음 (fail-closed)
+        tree = {
+            "PikPakBot": [_entry("mystery", True, "")],
+            "PikPakBot/mystery": [],
+        }
+        c = FakeClient(tree)
+        stats = cleanup_empty_dirs(c, "PikPakBot")
+        assert "PikPakBot/mystery" not in c.deleted
+        assert stats["protected"] == 1
+
 
 class TestAgeOk:
     def test_old(self):
@@ -127,5 +176,21 @@ class TestAgeOk:
         assert _age_ok(FRESH, timedelta(hours=24)) is False
 
     def test_missing_or_garbage(self):
-        assert _age_ok("", timedelta(hours=24)) is True
-        assert _age_ok("not-a-date", timedelta(hours=24)) is True
+        # fail-closed: 수정시각을 모르면 보존 (삭제하지 않음)
+        assert _age_ok("", timedelta(hours=24)) is False
+        assert _age_ok("not-a-date", timedelta(hours=24)) is False
+
+
+class TestParseMinAgeHours:
+    def test_valid(self):
+        assert parse_min_age_hours({"min_age_hours": 48}) == 48
+
+    def test_default_when_missing(self):
+        assert parse_min_age_hours({}) == 24
+
+    def test_garbage_falls_back(self):
+        assert parse_min_age_hours({"min_age_hours": "24h"}) == 24
+        assert parse_min_age_hours({"min_age_hours": None}) == 24
+
+    def test_negative_clamped(self):
+        assert parse_min_age_hours({"min_age_hours": -5}) == 0

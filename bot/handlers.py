@@ -457,9 +457,9 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_permission(update.effective_user.id):
         await update.message.reply_text("⛔ 권한이 없습니다.")
         return
-    from .maintenance import cleanup_empty_dirs
+    from .maintenance import cleanup_empty_dirs, parse_min_age_hours
     cfg = CONFIG.get("cleanup", {}) or {}
-    min_age = int(cfg.get("min_age_hours", 24))
+    min_age = parse_min_age_hours(cfg)
     status = await update.message.reply_text("🔍 빈 폴더 검사 중...")
     try:
         loop = asyncio.get_running_loop()
@@ -478,8 +478,8 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"외 {len(stats['deleted']) - 20}개")
     else:
         lines.append("삭제: 없음 (빈 폴더 없음)")
-    if stats["skipped_recent"]:
-        lines.append(f"유지: 최근 폴더 {stats['skipped_recent']}개")
+    if stats["protected"]:
+        lines.append(f"보호: 최근 변경/수정시각 없음 {stats['protected']}개")
     for err in stats["errors"][:5]:
         lines.append(f"⚠️ `{_code(err)}`")
     await status.edit_text(truncate_lines(lines), parse_mode=ParseMode.MARKDOWN)

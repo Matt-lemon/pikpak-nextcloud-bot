@@ -36,11 +36,22 @@ fi
 echo ""
 echo -e "${YELLOW}🔍 Nextcloud 연결 테스트 중...${NC}"
 pip3 install -q requests python-dotenv 2>/dev/null || pip install -q requests python-dotenv 2>/dev/null || true
-python3 test_nextcloud.py || {
-    echo ""
-    echo -e "${YELLOW}⚠️ 테스트 실패 - .env 확인 후 다시 실행: nano .env${NC}"
-    exit 1
-}
+# test_nextcloud.py는 tools/ 폴더에 있음
+if [ -f tools/test_nextcloud.py ]; then
+    python3 tools/test_nextcloud.py || {
+        echo ""
+        echo -e "${YELLOW}⚠️ 테스트 실패 - .env 확인 후 다시 실행: nano .env${NC}"
+        exit 1
+    }
+elif [ -f test_nextcloud.py ]; then
+    python3 test_nextcloud.py || {
+        echo ""
+        echo -e "${YELLOW}⚠️ 테스트 실패 - .env 확인 후 다시 실행: nano .env${NC}"
+        exit 1
+    }
+else
+    echo "⚠️ test_nextcloud.py를 찾을 수 없음, 테스트 건너뜀"
+fi
 
 echo ""
 echo -e "${GREEN}✅ 테스트 통과! Docker 실행 중...${NC}"

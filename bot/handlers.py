@@ -93,10 +93,16 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_command(update, context)
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_permission(update.effective_user.id):
+        await update.message.reply_text("⛔ 권한이 없습니다.")
+        return
     text = queue_manager.get_status_text()
     await update.message.reply_text(text)
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not check_permission(update.effective_user.id):
+        await update.message.reply_text("⛔ 권한이 없습니다.")
+        return
     try:
         files = nc_client.list_files(nc_client.base_path)
         await update.message.reply_text(f"📁 Nextcloud 파일 목록 (일부):\n{files[:3000]}")
@@ -546,18 +552,22 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.MARKDOWN
         )
 
-        # Nextcloud 업로드
+        # Nextcloud 업로드 - 동기 업로드를 executor에서 실행 (봇 응답 지연 방지)
         date_folder = datetime.now().strftime("%Y-%m-%d")
-        # 전달된 파일은 별도 폴더에 저장 (구분용)
         subfolder = "forwarded" if is_forwarded else "telegram"
         base_remote = f"{nc_client.base_path}/{date_folder}/{subfolder}".strip('/')
         remote_path = f"{base_remote}/{local_path.name}"
 
-        nc_client.upload_file(str(local_path), remote_path)
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, lambda: nc_client.upload_file(str(local_path), remote_path))
+        except Exception as e:
+            logger.error(f"Nextcloud upload failed: {e}")
+            raise
         
         # 공유 링크
         try:
-            share_url = nc_client.create_share_link(remote_path)
+            share_url = await loop.run_in_executor(None, lambda: nc_client.create_share_link(remote_path))
         except Exception as e:
             logger.warning(f"Share link failed: {e}")
             share_url = f"{nc_client.url}/apps/files/?dir=/{base_remote}"
@@ -578,6 +588,43 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True
         )
+
+        # 분할 파일 자동 복원 시도 (예: .part_000, .part00001, .tgparts.json)
+        # 전달받은 파일이 분할 조각이면 모든 조각이 모였는지 확인하고 자동 복원
+        try:
+            if ".part" in local_path.name or local_path.name.endswith(".tgparts.json") or local_path.suffix == ".json":
+                from .utils.file_splitter import restore_file
+                download_dir = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
+                
+                # manifest가 있으면 자동 복원 시도
+                if HAS_LARGE_INTEGRATION:
+                    # 비동기로 복원 체크 (블로킹 방지)
+                    loop = asyncio.get_event_loop()
+                    restored = await loop.run_in_executor(None, check_and_merge_parts, download_dir, False)
+                    if restored:
+                        await context.bot.send_message(
+                            chat_id=update.effective_chat.id,
+                            text=f"🎉 **자동 복원 완료!**\n"
+                                 f"파일: `{restored.name}` ({format_size(restored.stat().st_size)})\n"
+                                 f"원본이 복원되었습니다. Nextcloud에도 업로드됩니다.",
+                            parse_mode=ParseMode.MARKDOWN
+                        )
+                        # 복원된 파일도 Nextcloud에 업로드
+                        try:
+                            restored_remote = f"{nc_client.base_path}/{date_folder}/restored/{restored.name}".strip('/')
+                            await loop.run_in_executor(None, lambda: nc_client.upload_file(str(restored), restored_remote))
+                            restored_share = await loop.run_in_executor(None, lambda: nc_client.create_share_link(restored_remote))
+                            await context.bot.send_message(
+                                chat_id=update.effective_chat.id,
+                                text=f"✅ **복원 파일 Nextcloud 업로드 완료**\n"
+                                     f"파일: `{restored.name}`\n🔗 {restored_share}",
+                                parse_mode=ParseMode.MARKDOWN,
+                                disable_web_page_preview=True
+                            )
+                        except Exception as e:
+                            logger.warning(f"Restored file upload failed: {e}")
+        except Exception as e:
+            logger.warning(f"자동 복원 체크 실패 (무시): {e}")
 
         # 로컬 임시 파일 삭제 (선택)
         # local_path.unlink(missing_ok=True)
@@ -658,8 +705,13 @@ async def process_single_link(url: str, update: Update, context: ContextTypes.DE
     )
     queue_manager.add(task)
     
-    # 백그라운드 처리 시작
-    asyncio.create_task(process_download_task(task, context, detected))
+    # 백그라운드 처리 - 동시 다운로드 제한 준수 (세마포어)
+    # 기존: asyncio.create_task(process_download_task(...)) -> 제한 무시
+    # 수정: queue_manager.run_with_limit로 제한 준수
+    async def _run_limited():
+        await queue_manager.run_with_limit(task, process_download_task(task, context, detected))
+    
+    asyncio.create_task(_run_limited())
 
 async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAULT_TYPE, detected: dict):
     """실제 다운로드 + Nextcloud 업로드 (PikPak 핵심 로직)"""
@@ -739,14 +791,24 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
             else:
                 remote_path = f"{base_remote}/{file_path.name}"
 
-            def upload_progress_cb(uploaded, total_size):
-                pass
-
-            nc_client.upload_file(str(file_path), remote_path)
-            
-            # 공유 링크 생성
+            # 동기 업로드를 executor에서 실행 - 봇 전체 응답 지연 방지 + 타임아웃
+            loop = asyncio.get_event_loop()
             try:
-                share_url = nc_client.create_share_link(remote_path)
+                await loop.run_in_executor(
+                    None, 
+                    lambda fp=file_path, rp=remote_path: nc_client.upload_file(str(fp), rp)
+                )
+            except Exception as e:
+                logger.error(f"Upload failed for {file_path}: {e}")
+                raise
+            
+            # 공유 링크 생성 - 동기지만 빠른 요청이므로 executor 없이도 OK, 하지만 통일성 위해 executor 사용 가능
+            try:
+                # 공유 링크 생성도 executor에서 실행 (Nextcloud 요청 타임아웃 방지)
+                share_url = await loop.run_in_executor(
+                    None,
+                    lambda rp=remote_path: nc_client.create_share_link(rp)
+                )
                 uploaded_links.append((remote_path, share_url, file_path.stat().st_size))
             except Exception as e:
                 logger.warning(f"Share link failed: {e}")

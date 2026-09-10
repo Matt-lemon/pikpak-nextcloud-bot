@@ -11,12 +11,13 @@ logger = logging.getLogger(__name__)
 
 class NextcloudClient:
     """PikPak처럼 Nextcloud WebDAV + OCS Share API 연동 - v2 Chunking 공식 규격 준수"""
-    def __init__(self, url: str, username: str, password: str, base_path: str = "/PikPakBot", chunk_size: int = 10*1024*1024):
+    def __init__(self, url: str, username: str, password: str, base_path: str = "/PikPakBot", chunk_size: int = 10*1024*1024, timeout: int = 300):
         self.url = url.rstrip('/')
         self.username = username
         self.password = password
         self.base_path = base_path.strip('/')
         self.chunk_size = chunk_size
+        self.timeout = timeout  # Nextcloud 요청 타임아웃 (초) - 무응답 방지
         self.webdav_url = f"{self.url}/remote.php/dav/files/{self.username}"
         self.ocs_url = f"{self.url}/ocs/v2.php/apps/files_sharing/api/v1/shares"
         self.session = requests.Session()
@@ -38,7 +39,7 @@ class NextcloudClient:
             current = f"{current}/{part}" if current else part
             encoded = self._encode_path(current)
             url = f"{self.webdav_url}/{encoded}"
-            resp = self.session.request("MKCOL", url)
+            resp = self.session.request("MKCOL", url, timeout=self.timeout)
             if resp.status_code in [201, 405]:
                 continue
             elif resp.status_code not in [200, 201, 405]:
@@ -62,7 +63,7 @@ class NextcloudClient:
             return self._chunked_upload_v2(local_path, remote_path, progress_callback)
         
         with open(local_path, 'rb') as f:
-            resp = self.session.put(url, data=f)
+            resp = self.session.put(url, data=f, timeout=self.timeout)
             if resp.status_code in [200, 201, 204]:
                 logger.info(f"Uploaded {remote_path} ({file_size} bytes)")
                 return True
@@ -89,7 +90,7 @@ class NextcloudClient:
         
         # 1. MKCOL로 업로드 폴더 생성 - Destination 헤더 필수 (v2)
         headers = {"Destination": dest_url}
-        resp = self.session.request("MKCOL", chunk_dir, headers=headers)
+        resp = self.session.request("MKCOL", chunk_dir, headers=headers, timeout=self.timeout)
         if resp.status_code not in [200, 201, 204]:
             # 201이 정상, 이미 있으면 405일 수도 있지만 v2에서는 Destination으로 인해 201이어야 함
             logger.warning(f"MKCOL chunk dir failed: {resp.status_code} {resp.text}, trying continue")
@@ -115,10 +116,10 @@ class NextcloudClient:
                     "OC-Total-Length": str(file_size)
                 }
                 
-                resp = self.session.put(chunk_url, data=chunk, headers=headers)
+                resp = self.session.put(chunk_url, data=chunk, headers=headers, timeout=self.timeout)
                 if resp.status_code not in [200, 201, 204]:
                     # 실패 시 정리
-                    self.session.request("DELETE", chunk_dir)
+                    self.session.request("DELETE", chunk_dir, timeout=self.timeout)
                     raise Exception(f"Chunk upload failed {chunk_name}: {resp.status_code} {resp.text}")
                 
                 uploaded += len(chunk)
@@ -143,14 +144,14 @@ class NextcloudClient:
             "OC-Total-Length": str(file_size)
         }
         
-        resp = self.session.request("MOVE", assemble_url, headers=headers)
+        resp = self.session.request("MOVE", assemble_url, headers=headers, timeout=self.timeout)
         if resp.status_code in [200, 201, 204]:
             logger.info(f"Chunked upload v2 completed: {remote_path} ({file_size} bytes, {chunk_number-1} chunks)")
             return True
         else:
             logger.error(f"Chunked MOVE .file failed: {resp.status_code} {resp.text}")
             # 실패 시 업로드 폴더 삭제 시도
-            self.session.request("DELETE", chunk_dir)
+            self.session.request("DELETE", chunk_dir, timeout=self.timeout)
             raise Exception(f"Chunked upload finalize failed: {resp.status_code} {resp.text}")
 
     def create_share_link(self, remote_path: str) -> str:
@@ -161,7 +162,7 @@ class NextcloudClient:
             "shareType": 3,
             "permissions": 1
         }
-        resp = self.session.post(self.ocs_url, data=data, headers={"OCS-APIREQUEST": "true", "Accept": "application/json"})
+        resp = self.session.post(self.ocs_url, data=data, headers={"OCS-APIREQUEST": "true", "Accept": "application/json"}, timeout=self.timeout)
         try:
             j = resp.json()
             if j.get('ocs', {}).get('meta', {}).get('statuscode') == 200:
@@ -177,12 +178,12 @@ class NextcloudClient:
         remote_path = remote_path.strip('/')
         encoded = self._encode_path(remote_path)
         url = f"{self.webdav_url}/{encoded}"
-        resp = self.session.request("PROPFIND", url, headers={"Depth": "1"})
+        resp = self.session.request("PROPFIND", url, headers={"Depth": "1"}, timeout=self.timeout)
         return resp.text
 
     def get_quota(self):
         try:
-            resp = self.session.request("PROPFIND", self.webdav_url, headers={"Depth": "0"})
+            resp = self.session.request("PROPFIND", self.webdav_url, headers={"Depth": "0"}, timeout=self.timeout)
             return resp.text[:1000]
         except:
             return "Unknown"

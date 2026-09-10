@@ -486,7 +486,7 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("삭제: 없음 (빈 폴더 없음)")
     if stats["protected"]:
-        lines.append(f"보호: 최근 변경/수정시각 없음 {stats['protected']}개")
+        lines.append(f"보호: 오늘/미래·최근 변경·수정시각 없음 {stats['protected']}개")
     for err in stats["errors"][:5]:
         lines.append(f"⚠️ `{_code(err)}`")
     await status.edit_text(truncate_lines(lines), parse_mode=ParseMode.MARKDOWN)

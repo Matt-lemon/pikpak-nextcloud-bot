@@ -31,6 +31,9 @@ notifications:
   send_thumbnail: true
 
 # 빈 폴더 일일 정리 (PikPakBot 하위 재귀 스캔, bottom-up 삭제)
+# 삭제 규칙 (빈 폴더일 때):
+#   - YYYY-MM-DD 날짜 폴더: 오늘/미래는 보호, 지난 날짜는 수정시각과 무관하게 삭제
+#   - 그 외 폴더: min_age_hours보다 오래됐을 때만 삭제 (수정시각 없으면 보존)
 # 기본 OFF (opt-in): 자동 실행하려면 cleanup.enabled: true 또는 텔레그램 /cleanup_on
 # 텔레그램 전환: /cleanup_on · /cleanup_off (상태는 ./data/cleanup_state.json에 저장,
 # 텔레그램 토글이 config.enabled보다 우선, 상태 파일 손상 시 자동 OFF)
@@ -39,7 +42,7 @@ cleanup:
   enabled: false   # 기본 OFF. 자동 실행을 원하면 true 또는 /cleanup_on
   hour: 4          # 매일 실행 시각 (서버 로컬 시간)
   minute: 0
-  min_age_hours: 24  # 이보다 최근에 변경된 폴더는 보호 (수정시각 없으면 보존)
+  min_age_hours: 24  # 날짜가 아닌 폴더의 보호 시간 (수정시각 없으면 보존)
   notify: true     # 삭제/오류 발생 시 첫 허용 사용자에게 알림 (없으면 조용히 통과)
 
 # 보안 설정 (코드에서 .env로 관리되지만 문서화)

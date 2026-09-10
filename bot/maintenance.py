@@ -3,17 +3,25 @@
 - base_path 하위를 재귀 스캔, 빈 폴더를 bottom-up으로 삭제
 - base 자체는 절대 삭제하지 않음
 - 파일이 있는 부모라도 하위 폴더는 계속 탐색 (mixed tree)
-- 최근 수정된 폴더(min_age_hours 이내)는 보호 (당일 작업 폴더 등)
-- 수정시각이 없거나 깨졌으면 보존 (fail-closed)
+- 삭제 규칙 (빈 폴더일 때):
+  - 정확히 YYYY-MM-DD 형식의 날짜 폴더: 달력 날짜 기준
+    오늘/미래는 보호, 지난 날짜는 수정시각과 무관하게 삭제
+  - 그 외 폴더: min_age_hours보다 오래됐을 때만 삭제,
+    수정시각이 없거나 깨졌으면 보존 (fail-closed)
 - base_path가 비어 있으면 거부 (루트 오삭제 방지)
 - 삭제 직전 재조회로 검증 (업로드 레이스 방지)
 - 동기 함수: 호출 측에서 executor/to_thread로 실행할 것
 """
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 logger = logging.getLogger(__name__)
+
+# 정확한 YYYY-MM-DD (0-padding 필수). strptime(%m/%d)은 "2026-9-1"도 허용하므로
+# 형식은 정규식으로 먼저 검사하고, 유효한 달력 날짜인지는 strptime으로 확인.
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def _age_ok(modified: str, min_age: timedelta) -> bool:
@@ -38,6 +46,27 @@ def parse_min_age_hours(cfg: dict, default: int = 24) -> int:
         return max(0, int(cfg.get("min_age_hours", default)))
     except (TypeError, ValueError):
         return default
+
+
+def _date_folder_status(name: str, today=None) -> str:
+    """YYYY-MM-DD 폴더의 달력 날짜 상태 반환.
+
+    반환: 'past'(오늘 이전) / 'today' / 'future'(오늘 이후) / ''(날짜 형식 아님)
+    today를 주지 않으면 서버 로컬 날짜 사용 (일일 스케줄러와 동일한 시계).
+    """
+    if not _DATE_RE.fullmatch(name):
+        return ""
+    try:
+        folder_date = datetime.strptime(name, "%Y-%m-%d").date()
+    except ValueError:
+        return ""  # 2026-13-01, 2026-02-30 등 존재하지 않는 날짜
+    if today is None:
+        today = datetime.now().astimezone().date()
+    if folder_date > today:
+        return "future"
+    if folder_date < today:
+        return "past"
+    return "today"
 
 
 def cleanup_empty_dirs(nc_client, base_path: str, min_age_hours: int = 24,
@@ -73,8 +102,15 @@ def cleanup_empty_dirs(nc_client, base_path: str, min_age_hours: int = 24,
             return True  # base 자체는 절대 삭제 안 함
         if has_files or child_remains:
             return True  # 파일이 있거나 살아남은 하위 폴더가 있으면 유지
-        if not _age_ok(modified, min_age):
-            stats["protected"] += 1  # 최근 변경 또는 수정시각 없음(fail-closed)
+        name = remote.rsplit("/", 1)[-1]
+        date_status = _date_folder_status(name)
+        if date_status == "past":
+            pass  # 지난 날짜의 빈 YYYY-MM-DD 폴더: 수정시각과 무관하게 삭제
+        elif date_status in ("today", "future"):
+            stats["protected"] += 1  # 오늘/미래 날짜 폴더는 절대 삭제 안 함
+            return True
+        elif not _age_ok(modified, min_age):
+            stats["protected"] += 1  # 날짜 폴더가 아니면 mtime/연령 보호
             return True
         # 삭제 직전 재확인 (이 사이 업로드 시작 레이스 방지)
         try:

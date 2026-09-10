@@ -4,7 +4,9 @@ from email.utils import format_datetime
 
 import pytest
 
-from bot.maintenance import cleanup_empty_dirs, _age_ok, parse_min_age_hours
+from bot.maintenance import (
+    cleanup_empty_dirs, _age_ok, parse_min_age_hours, _date_folder_status,
+)
 
 
 def _entry(name, is_dir, modified=""):
@@ -167,6 +169,52 @@ class TestCleanupEmptyDirs:
         assert "PikPakBot/mystery" not in c.deleted
         assert stats["protected"] == 1
 
+    def test_past_date_folder_deleted_even_without_mtime(self):
+        # 지난 날짜의 빈 YYYY-MM-DD 폴더는 수정시각이 없어도 삭제 (달력 날짜 기준)
+        past = (datetime.now().astimezone().date() - timedelta(days=2)).strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(past, True, "")],
+            f"PikPakBot/{past}": [],
+        }
+        c = FakeClient(tree)
+        stats = cleanup_empty_dirs(c, "PikPakBot")
+        assert f"PikPakBot/{past}" in c.deleted
+        assert stats["protected"] == 0
+
+    def test_today_date_folder_never_deleted(self):
+        # 오늘 날짜 폴더는 mtime이 오래돼도 절대 삭제 안 함
+        today = datetime.now().astimezone().date().strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(today, True, OLD)],
+            f"PikPakBot/{today}": [],
+        }
+        c = FakeClient(tree)
+        stats = cleanup_empty_dirs(c, "PikPakBot")
+        assert f"PikPakBot/{today}" not in c.deleted
+        assert stats["protected"] == 1
+
+    def test_future_date_folder_protected(self):
+        future = (datetime.now().astimezone().date() + timedelta(days=2)).strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(future, True, OLD)],
+            f"PikPakBot/{future}": [],
+        }
+        c = FakeClient(tree)
+        stats = cleanup_empty_dirs(c, "PikPakBot")
+        assert f"PikPakBot/{future}" not in c.deleted
+        assert stats["protected"] == 1
+
+    def test_today_date_folder_has_file_not_deleted(self):
+        # 오늘 폴더에 파일이 있으면 당연히 삭제 안 함 (하위 파일 우선 보호)
+        today = datetime.now().astimezone().date().strftime("%Y-%m-%d")
+        tree = {
+            "PikPakBot": [_entry(today, True, "")],
+            f"PikPakBot/{today}": [_entry("a.mp4", False, OLD)],
+        }
+        c = FakeClient(tree)
+        cleanup_empty_dirs(c, "PikPakBot")
+        assert f"PikPakBot/{today}" not in c.deleted
+
 
 class TestAgeOk:
     def test_old(self):
@@ -194,3 +242,30 @@ class TestParseMinAgeHours:
 
     def test_negative_clamped(self):
         assert parse_min_age_hours({"min_age_hours": -5}) == 0
+
+
+class TestDateFolderStatus:
+    T = datetime(2026, 9, 11).date()  # 고정된 '오늘' 기준
+
+    def test_past(self):
+        assert _date_folder_status("2026-09-10", self.T) == "past"
+
+    def test_today(self):
+        assert _date_folder_status("2026-09-11", self.T) == "today"
+
+    def test_future(self):
+        assert _date_folder_status("2026-09-12", self.T) == "future"
+
+    def test_non_zero_padded_not_date(self):
+        # strptime은 "2026-9-1"도 허용하지만, 규칙상 정확한 YYYY-MM-DD만 날짜로 취급
+        assert _date_folder_status("2026-9-1", self.T) == ""
+
+    def test_invalid_calendar_dates(self):
+        assert _date_folder_status("2026-13-01", self.T) == ""   # 없는 달
+        assert _date_folder_status("2026-02-30", self.T) == ""   # 없는 날
+        assert _date_folder_status("0000-01-01", self.T) == ""   # year 0
+
+    def test_non_date_names(self):
+        assert _date_folder_status("misc", self.T) == ""
+        assert _date_folder_status("20260910", self.T) == ""
+        assert _date_folder_status("", self.T) == ""

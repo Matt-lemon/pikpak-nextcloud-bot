@@ -63,6 +63,7 @@ services:
     volumes:
       - ./downloads:/downloads
       - ./logs:/app/logs
+      - ./data:/app/data  # 빈 폴더 자동 정리 on/off 상태 (텔레그램 /cleanup_on·/cleanup_off)
       - ./bot-api-data:/var/lib/telegram-bot-api:ro  # 로컬 Bot API 다운로드 폴더 공유 (다운로드는 제한 없음)
       - ./config.yaml:/app/config.yaml:ro  # SECURITY FIX: Mount config.yaml
       - /etc/localtime:/etc/localtime:ro

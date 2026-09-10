@@ -8,11 +8,13 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from .handlers import (
     start_command, help_command, status_command, list_command,
-    cleanup_command, merge_command, sendlarge_command,
+    cleanup_command, cleanup_on_command, cleanup_off_command,
+    merge_command, sendlarge_command,
     handle_message, init_managers, purge_old_downloads,
     handle_video, handle_audio, handle_photo, handle_voice,
     handle_video_note, handle_animation
 )
+from . import cleanup_state
 
 # 로깅 설정
 logging.basicConfig(
@@ -144,6 +146,10 @@ def main():
             logger.info(f"🧹 다음 빈 폴더 정리: {nxt.strftime('%m-%d %H:%M')}")
             await asyncio.sleep((nxt - now).total_seconds())
             try:
+                # 텔레그램 /cleanup_on·/cleanup_off 토글 우선, 없으면 config 기본값
+                if not cleanup_state.get_enabled(cfg.get("enabled", False)):
+                    logger.info("🧹 빈 폴더 일일 정리: 자동 실행 꺼짐 — 이번 회차 건너뜀 (/cleanup_on으로 활성화)")
+                    continue
                 stats = await asyncio.to_thread(
                     cleanup_empty_dirs, _h.nc_client, _h.nc_client.base_path,
                     parse_min_age_hours(cfg))
@@ -168,17 +174,20 @@ def main():
 
     async def post_init(app):
         cfg = config.get("cleanup", {}) or {}
-        # SECURITY: 자동 삭제는 기본 OFF (opt-in). cleanup.enabled: true를
-        # 명시한 사용자에게만 매일 자동 실행됨 (기존 사용자 놀라움 방지).
-        if not cfg.get("enabled", False):
-            logger.info("🧹 빈 폴더 일일 정리: 자동 실행 비활성화 (config.yaml에서 cleanup.enabled: true로 명시해야 활성화)")
-            return
+        # 자동 삭제는 opt-in: 기본값 config.cleanup.enabled(기본 False) +
+        # 텔레그램 /cleanup_on·/cleanup_off 토글(상태 파일 영속). 스케줄러는 항상
+        # 띄워두고, 실행 시점에 토글 상태를 확인한다 (끈 상태에서 /cleanup_on으로 켜면
+        # 재시작 없이 다음 예약부터 동작).
+        enabled = cleanup_state.get_enabled(cfg.get("enabled", False))
         try:
             hour, minute = int(cfg.get("hour", 4)), int(cfg.get("minute", 0))
         except (TypeError, ValueError):
             hour, minute = 4, 0
         app.create_task(_daily_cleanup_loop(app), name="nc-cleanup")
-        logger.info(f"🧹 빈 폴더 일일 정리 예약됨 (매일 {hour % 24:02d}:{minute % 60:02d} 로컬 시각)")
+        logger.info(
+            f"🧹 빈 폴더 일일 정리: 자동 실행 {'켜짐' if enabled else '꺼짐'} "
+            f"(/cleanup_on·/cleanup_off로 변경, 매일 {hour % 24:02d}:{minute % 60:02d} 로컬 시각)"
+        )
 
     if bot_api_url:
         logger.info(f"🌐 로컬 Bot API 사용: {bot_api_url} (다운로드 무제한, 업로드 2,000MB)")
@@ -203,6 +212,8 @@ def main():
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("cleanup", cleanup_command))
+    app.add_handler(CommandHandler("cleanup_on", cleanup_on_command))
+    app.add_handler(CommandHandler("cleanup_off", cleanup_off_command))
     app.add_handler(CommandHandler("merge", merge_command))
     app.add_handler(CommandHandler("sendlarge", sendlarge_command))
     

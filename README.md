@@ -163,6 +163,9 @@ docker compose exec bot python tools/restore_from_telegram.py /downloads/
 /start - 시작
 /status - 큐 상태
 /list - Nextcloud 목록
+/cleanup - 빈 폴더 즉시 정리 (수동)
+/cleanup_on - 빈 폴더 자동 정리 켜기 (매일 새벽 자동 실행)
+/cleanup_off - 빈 폴더 자동 정리 끄기
 /merge - 분할 파일 복원
 /sendlarge <경로> - 대용량 파일 분할 전송
 ```

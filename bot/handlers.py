@@ -379,7 +379,9 @@ PikPak처럼 링크만 보내면 Nextcloud에 자동 저장!
 /help - 도움말
 /status - 큐 상태 확인
 /list - Nextcloud 파일 목록
-/cleanup - Nextcloud 빈 폴더 정리 (매일 새벽 자동 실행)
+/cleanup - Nextcloud 빈 폴더 정리 (즉시 수동 실행)
+/cleanup_on - 빈 폴더 자동 정리 켜기 (매일 새벽 자동 실행)
+/cleanup_off - 빈 폴더 자동 정리 끄기
 /merge - 분할된 파일 자동 복원
 /sendlarge <경로> - Nextcloud의 대용량 파일을 텔레그램으로 분할 전송
 
@@ -458,8 +460,10 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ 권한이 없습니다.")
         return
     from .maintenance import cleanup_empty_dirs, parse_min_age_hours
+    from . import cleanup_state
     cfg = CONFIG.get("cleanup", {}) or {}
     min_age = parse_min_age_hours(cfg)
+    auto = cleanup_state.get_enabled(cfg.get("enabled", False))
     status = await update.message.reply_text("🔍 빈 폴더 검사 중...")
     try:
         loop = asyncio.get_running_loop()
@@ -469,7 +473,10 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ 정리 실패: `{_code(str(e)[:300])}`",
                                parse_mode=ParseMode.MARKDOWN)
         return
-    lines = [f"🧹 빈 폴더 정리 완료 (검사 {stats['scanned']}개 폴더)"]
+    lines = [
+        f"🧹 빈 폴더 정리 완료 (검사 {stats['scanned']}개 폴더)",
+        f"자동 실행: {'🟢 켜짐' if auto else '⚪ 꺼짐'} — `/cleanup_on` · `/cleanup_off`",
+    ]
     if stats["deleted"]:
         lines.append(f"삭제: {len(stats['deleted'])}개")
         for p in stats["deleted"][:20]:
@@ -483,6 +490,41 @@ async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for err in stats["errors"][:5]:
         lines.append(f"⚠️ `{_code(err)}`")
     await status.edit_text(truncate_lines(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def _toggle_cleanup_auto(update: Update, enabled: bool):
+    """빈 폴더 자동 정리 on/off 전환 (권한 필요, 상태 파일에 영속화)."""
+    if not check_permission(update.effective_user.id):
+        await update.message.reply_text("⛔ 권한이 없습니다.")
+        return
+    from . import cleanup_state
+    persisted = cleanup_state.set_enabled(enabled)
+    if enabled:
+        text = (
+            "🧹 빈 폴더 자동 정리: **켜짐 ✅**\n"
+            "매일 정해진 시각(기본 04:00)에 자동 실행됩니다.\n"
+            "즉시 실행하려면 /cleanup"
+        )
+    else:
+        text = (
+            "🧹 빈 폴더 자동 정리: **꺼짐 ⚪**\n"
+            "일일 자동 실행이 중지됩니다.\n"
+            "수동 정리는 /cleanup으로 언제든 가능합니다."
+        )
+    if not persisted:
+        text += "\n\n⚠️ 상태 저장 실패: 재시작하면 config.yaml 기준으로 복귀합니다."
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cleanup_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """빈 폴더 자동 정리 켜기."""
+    await _toggle_cleanup_auto(update, True)
+
+
+async def cleanup_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """빈 폴더 자동 정리 끄기."""
+    await _toggle_cleanup_auto(update, False)
+
 
 async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """분할된 파일 자동 복원 명령어"""

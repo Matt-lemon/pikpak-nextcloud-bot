@@ -7,6 +7,7 @@
 # Runtime
 downloads/
 logs/
+data/
 aria2-config/
 __pycache__/
 *.pyc

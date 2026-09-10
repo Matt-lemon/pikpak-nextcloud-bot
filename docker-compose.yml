@@ -33,6 +33,7 @@ services:
     volumes:
       - ./downloads:/downloads
       - ./logs:/app/logs
+      - ./data:/app/data  # 빈 폴더 자동 정리 on/off 상태 (텔레그램 /cleanup_on·/cleanup_off)
       - ./config.yaml:/app/config.yaml:ro  # SECURITY FIX: Mount config.yaml (was commented out)
       - /etc/localtime:/etc/localtime:ro
     environment:

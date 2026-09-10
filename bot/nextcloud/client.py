@@ -6,6 +6,7 @@ from urllib.parse import quote
 import logging
 import aiofiles
 import asyncio
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,40 @@ class NextcloudClient:
                 logger.error(f"Upload failed {remote_path}: {resp.status_code} {resp.text}")
                 raise Exception(f"Upload failed: {resp.status_code}")
 
+    def download_file(self, remote_path: str, local_path: str | Path, progress_callback=None) -> Path:
+        """
+        WebDAV에서 파일 다운로드 - 스트리밍으로 메모리 효율적
+        /sendlarge Nextcloud 다운로드 구현용
+        """
+        local_path = Path(local_path)
+        remote_path = remote_path.strip('/')
+        encoded_path = self._encode_path(remote_path)
+        url = f"{self.webdav_url}/{encoded_path}"
+        
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        logger.info(f"📥 Downloading from Nextcloud: {remote_path} -> {local_path}")
+        
+        # 스트리밍 다운로드
+        with self.session.get(url, stream=True, timeout=self.timeout) as resp:
+            if resp.status_code not in [200, 206]:
+                raise Exception(f"Download failed {remote_path}: {resp.status_code} {resp.text[:500]}")
+            
+            total_size = int(resp.headers.get('Content-Length', 0))
+            downloaded = 0
+            
+            with open(local_path, 'wb') as f:
+                for chunk in resp.iter_content(chunk_size=8*1024*1024):  # 8MB씩
+                    if not chunk:
+                        continue
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback:
+                        progress_callback(downloaded, total_size)
+        
+        logger.info(f"✅ Downloaded {remote_path} ({local_path.stat().st_size} bytes)")
+        return local_path
+
     def _chunked_upload_v2(self, local_path: Path, remote_path: str, progress_callback=None):
         """
         Nextcloud Chunked Upload v2 공식 규격 준수
@@ -80,8 +115,18 @@ class NextcloudClient:
         - 청크 이름: 00001 ~ 10000 (5자리 숫자, 1~10000)
         - OC-Total-Length 헤더 필요
         - 마지막 MOVE는 .../transfer-id/.file 에서 destination으로
+        
+        Bug fix: 청크 개수 검사 off-by-one 수정
+        - 기존: 10000번째 청크 업로드 후 chunk_number가 10001이 되어 실패
+        - 수정: 업로드 전 검사 + 사전 계산으로 10000까지 허용
         """
         file_size = local_path.stat().st_size
+        # 사전 검증: 필요한 청크 수 계산
+        total_chunks_needed = math.ceil(file_size / self.chunk_size)
+        if total_chunks_needed > 10000:
+            min_chunk_size = math.ceil(file_size / 10000)
+            raise Exception(f"Too many chunks ({total_chunks_needed} > 10000), increase chunk_size (현재 {self.chunk_size} bytes, 필요 최소 {min_chunk_size} bytes)")
+
         # 고유한 transfer ID 생성
         import uuid
         transfer_id = f"pikpak-{uuid.uuid4().hex[:16]}"
@@ -92,7 +137,6 @@ class NextcloudClient:
         headers = {"Destination": dest_url}
         resp = self.session.request("MKCOL", chunk_dir, headers=headers, timeout=self.timeout)
         if resp.status_code not in [200, 201, 204]:
-            # 201이 정상, 이미 있으면 405일 수도 있지만 v2에서는 Destination으로 인해 201이어야 함
             logger.warning(f"MKCOL chunk dir failed: {resp.status_code} {resp.text}, trying continue")
         
         # 2. 청크 업로드 - 5자리 숫자 이름, Destination + OC-Total-Length 헤더
@@ -101,12 +145,17 @@ class NextcloudClient:
         
         with open(local_path, 'rb') as f:
             while True:
+                # off-by-one fix: 업로드 전에 청크 번호가 10000 초과인지 검사
+                # 공식 규격: 1~10000 허용, 10001번째부터 금지
+                if chunk_number > 10000:
+                    self.session.request("DELETE", chunk_dir, timeout=self.timeout)
+                    raise Exception(f"Too many chunks (>10000), stopped at chunk {chunk_number}, increase chunk_size")
+                
                 chunk = f.read(self.chunk_size)
                 if not chunk:
                     break
                 
                 # v2 규격: 청크 이름은 1~10000 사이의 숫자, 5자리 패딩 (00001, 00002...)
-                # 공식 예시는 00001 형식
                 chunk_name = f"{chunk_number:05d}"
                 chunk_url = f"{chunk_dir}/{chunk_name}"
                 
@@ -118,26 +167,19 @@ class NextcloudClient:
                 
                 resp = self.session.put(chunk_url, data=chunk, headers=headers, timeout=self.timeout)
                 if resp.status_code not in [200, 201, 204]:
-                    # 실패 시 정리
                     self.session.request("DELETE", chunk_dir, timeout=self.timeout)
                     raise Exception(f"Chunk upload failed {chunk_name}: {resp.status_code} {resp.text}")
                 
                 uploaded += len(chunk)
-                chunk_number += 1
                 
                 if progress_callback:
                     progress_callback(uploaded, file_size)
                 
                 logger.debug(f"Uploaded chunk {chunk_name}: {len(chunk)} bytes ({uploaded}/{file_size})")
                 
-                # 청크 수 10000개 제한 체크
-                if chunk_number > 10000:
-                    self.session.request("DELETE", chunk_dir)
-                    raise Exception("Too many chunks (>10000), increase chunk_size")
+                chunk_number += 1
 
         # 3. MOVE로 최종 조립 - .../.file 에서 destination으로, Destination + OC-Total-Length 헤더
-        # 공식: MOVE https://server/remote.php/dav/uploads/{user}/{transfer-id}/.file
-        #       Destination: https://server/remote.php/dav/files/{user}/dest/file.zip
         assemble_url = f"{chunk_dir}/.file"
         headers = {
             "Destination": dest_url,
@@ -150,7 +192,6 @@ class NextcloudClient:
             return True
         else:
             logger.error(f"Chunked MOVE .file failed: {resp.status_code} {resp.text}")
-            # 실패 시 업로드 폴더 삭제 시도
             self.session.request("DELETE", chunk_dir, timeout=self.timeout)
             raise Exception(f"Chunked upload finalize failed: {resp.status_code} {resp.text}")
 

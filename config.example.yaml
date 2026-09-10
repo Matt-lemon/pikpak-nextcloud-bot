@@ -1,27 +1,47 @@
 bot:
   name: "PikPak Clone Bot"
   language: "ko"
-  max_file_size_gb: 20
+  max_file_size_gb: 20  # SECURITY: 최대 파일 크기 - 디스크 고갈 방지, 다운로드 전 검사
 
 download:
   # PikPak처럼 모든 링크 지원
   http:
     enabled: true
-    max_size: 20GB
+    max_size: 20GB  # HTTP 최대 크기 - Content-Length 사전 검사 + 다운로드 중 검사
+    # SSRF 방어: 내부 IP, localhost, aria2 등 차단 (코드에서 자동)
   torrent:
     enabled: true
     use_aria2: true
     seed_time: 0  # 0이면 시드 안함
+    max_size: 20GB  # 토렌트 최대 크기 - total_length로 사전 검사
   ytdlp:
     enabled: true
     format: "bestvideo[ext=mp4]+bestaudio/best"
     sites: ["youtube.com", "youtu.be", "twitter.com", "x.com", "instagram.com", "tiktok.com"]
+    noplaylist: true  # SECURITY: 플레이리스트 전체 다운로드 방지 (기본 True)
+    max_size: 20GB
 
 nextcloud:
-  create_share_link: true
+  create_share_link: true  # false면 공유 링크 생성 안 함 (프라이버시)
   share_permissions: 1  # 1=읽기만
   auto_create_folder_per_date: true  # /PikPakBot/2024-09-10/ 형식
 
 notifications:
   send_progress_every: 5  # 5%마다 진행률 업데이트
   send_thumbnail: true
+
+# 보안 설정 (코드에서 .env로 관리되지만 문서화)
+security:
+  # ALLOWED_USER_IDS는 .env에서 필수 - 비어있으면 봇 시작 거부 (Critical fix)
+  # ALLOW_UNAUTHENTICATED=true로 명시적 허용 가능 (비권장)
+  # ARIA2_SECRET은 .env에서 필수 - 기본값 없음
+  # /sendlarge는 DOWNLOAD_DIR 내부 파일만 허용 (Path Traversal 방지)
+  # HTTP 다운로더는 SSRF 방어: private IP, localhost, metadata 서비스 차단
+  # 파일명은 safe_name()으로 검증 + DOWNLOAD_DIR 내부 확인
+
+# 대시보드 설정
+dashboard:
+  require_auth: true  # true면 인증 필요
+  username: admin  # DASHBOARD_USERNAME 환경변수로 덮어씀
+  # password는 .env의 DASHBOARD_PASSWORD로 설정 (평문 저장 금지)
+  bind: "127.0.0.1:8000"  # 외부 노출 시 0.0.0.0으로 변경 + 인증 필수

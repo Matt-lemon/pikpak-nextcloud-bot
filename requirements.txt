@@ -1,11 +1,15 @@
-python-telegram-bot==20.7
+# Security fixes: yt-dlp vulnerable <2024.07.01 (GHSA-79w7-vh3h-8g4j) -> updated to >=2024.7.1
+# PTB 20.7 loads large files into memory -> updated to >=21.5 for read_file_handle=False streaming
+python-telegram-bot>=21.5,<23
 python-dotenv==1.0.0
-aiohttp==3.9.5
-aiofiles==23.2.1
-yt-dlp==2024.5.27
-aria2p==0.11.1
-requests==2.31.0
-PyYAML==6.0.1
-humanize==4.9.0
+aiohttp>=3.9.5
+aiofiles>=23.2.1
+yt-dlp>=2024.7.1
+aria2p>=0.11.1
+requests>=2.31.0
+PyYAML>=6.0.1
+humanize>=4.9.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
 # libtorrent는 aria2로 대체, 필요시 수동 설치
 # libtorrent>=2.0.11

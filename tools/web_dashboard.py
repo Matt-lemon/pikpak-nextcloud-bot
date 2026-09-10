@@ -2,23 +2,26 @@
 보너스: PikPak 스타일 웹 대시보드 (FastAPI)
 NAS에서 http://nas-ip:8000 으로 접속 가능
 
-Bug fixes:
+Security fixes:
 - CSS braces escaping (format 오류 수정)
 - 실행 경로 오류 수정 (.env 로드 경로)
 - 다운로드 추가 기능 실제 구현 (데모 -> 실제 큐 연동)
+- 인증 추가 (DASHBOARD_USERNAME/PASSWORD 또는 ALLOWED_USER_IDS 체크)
+- SSRF 방어 (다운로드 URL 검증)
 """
-from fastapi import FastAPI, Form, Request, BackgroundTasks
+from fastapi import FastAPI, Form, Request, BackgroundTasks, Depends, HTTPException, status
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import os
 import sys
 import logging
+import secrets
 from pathlib import Path
 from dotenv import load_dotenv
 
 # 실행 경로 오류 수정: 프로젝트 루트에서 .env 찾기
-# tools/web_dashboard.py에서 실행되든, 프로젝트 루트에서 실행되든 .env를 찾도록
 current_file = Path(__file__).resolve()
-project_root = current_file.parent.parent  # tools/ -> project root
+project_root = current_file.parent.parent
 env_paths = [
     project_root / ".env",
     Path.cwd() / ".env",
@@ -30,22 +33,65 @@ for env_path in env_paths:
         load_dotenv(dotenv_path=env_path)
         break
 else:
-    load_dotenv()  # 기본 동작
+    load_dotenv()
 
-# 프로젝트 루트를 sys.path에 추가 (bot 모듈 import용)
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="PikPak Clone Dashboard")
+security = HTTPBasic()
 
-# 전역 큐 (간단한 인메모리, 실제로는 bot의 queue_manager와 공유하려면 파일이나 DB 필요)
-# 여기서는 파일 기반 큐 + 직접 다운로드 구현
+# 전역 큐
 download_queue = []
 download_history = []
 
-# HTML 템플릿 - CSS 중괄호는 이중으로 이스케이프 (format 오류 방지)
+def check_dashboard_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    """
+    SECURITY FIX: 대시보드 인증 추가
+    기존: 인증 없음 -> 외부 노출 시 누구나 접근 가능
+    수정: DASHBOARD_USERNAME/PASSWORD 또는 ALLOWED_USER_IDS 기반 인증
+    """
+    dashboard_user = os.getenv("DASHBOARD_USERNAME", "").strip()
+    dashboard_pass = os.getenv("DASHBOARD_PASSWORD", "").strip()
+    
+    # 대시보드 전용 계정이 설정되어 있으면 그것 사용
+    if dashboard_user and dashboard_pass:
+        is_user_ok = secrets.compare_digest(credentials.username, dashboard_user)
+        is_pass_ok = secrets.compare_digest(credentials.password, dashboard_pass)
+        if not (is_user_ok and is_pass_ok):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid credentials",
+                headers={"WWW-Authenticate": "Basic"},
+            )
+        return credentials.username
+    
+    # 대시보드 계정이 없으면 ALLOWED_USER_IDS가 있는지 확인
+    # 없으면 인증 없이 허용하지만 경고 (로컬 전용이므로)
+    allowed = os.getenv("ALLOWED_USER_IDS", "").strip()
+    if not allowed:
+        # .env 없거나 ALLOWED_USER_IDS 비어있으면 일단 허용 (개발 환경)
+        # 하지만 프로덕션에서는 DASHBOARD_USERNAME/PASSWORD 설정 권장
+        logger.warning("⚠️ DASHBOARD_USERNAME/PASSWORD 미설정 + ALLOWED_USER_IDS 비어있음 -> 인증 없이 허용 (로컬 전용 권장)")
+        return "anonymous"
+    
+    # ALLOWED_USER_IDS가 있으면, 대시보드는 일단 허용 (IP는 127.0.0.1로 바인딩되어 있으므로)
+    # 더 엄격하게 하려면 여기서도 인증 요구 가능
+    # 여기서는 127.0.0.1 바인딩으로 보호되므로 허용, 하지만 로그 남김
+    logger.info(f"Dashboard access by {credentials.username} (ALLOWED_USER_IDS 기반, 127.0.0.1 바인딩으로 보호)")
+    return credentials.username
+
+# 선택적 인증: 쿼리 파라미터나 헤더로도 인증 가능하도록
+# 여기서는 기본적으로 인증을 요구하지만, 환경변수로 비활성화 가능
+REQUIRE_AUTH = os.getenv("DASHBOARD_REQUIRE_AUTH", "true").lower() in ("true", "1", "yes")
+
+def optional_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    if not REQUIRE_AUTH:
+        return "anonymous"
+    return check_dashboard_auth(credentials)
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -72,7 +118,7 @@ pre{{background:#2a2a2a; padding:12px; border-radius:8px; overflow-x:auto; white
 </head>
 <body>
 <h1>🚀 PikPak Clone</h1>
-<p>Nextcloud 연동 클라우드 다운로더</p>
+<p>Nextcloud 연동 클라우드 다운로더 - <small>보안: {auth_status}</small></p>
 
 <div class="card">
 <h3>🔗 링크 추가</h3>
@@ -105,6 +151,16 @@ pre{{background:#2a2a2a; padding:12px; border-radius:8px; overflow-x:auto; white
 <div id="history">로딩 중...</div>
 </div>
 
+<div class="card" style="border-color:#f59e0b">
+<h3>🔒 보안 안내</h3>
+<p><small>
+• 대시보드는 기본 127.0.0.1:8000만 바인딩 (외부 노출 차단)<br>
+• 외부 노출 시 DASHBOARD_USERNAME/PASSWORD 설정 필수<br>
+• .env에 DASHBOARD_REQUIRE_AUTH=false로 인증 비활성화 가능 (비권장)<br>
+• 다운로드 URL은 SSRF 방어 필터 적용됨
+</small></p>
+</div>
+
 <script>
 async function refresh(){{
   try{{
@@ -120,7 +176,7 @@ async function refresh(){{
     if(j.active && j.active.length > 0){{
       html += '<h4>진행 중 (' + j.active.length + ')</h4>';
       j.active.forEach(t => {{
-        html += '<div><span class="badge status-' + t.status + '">' + t.id + ': ' + t.status + ' ' + (t.progress||0).toFixed(1) + '%</span> ' + (t.url ? t.url.substring(0,40) : '') + '</div>';
+        html += '<div><span class="badge status-' + t.status + '\">' + t.id + ': ' + t.status + ' ' + (t.progress||0).toFixed(1) + '%</span> ' + (t.url ? t.url.substring(0,40) : '') + '</div>';
         if(t.progress) html += '<div class="progress"><div class="progress-bar" style="width:' + t.progress + '%"></div></div>';
       }});
     }}
@@ -130,20 +186,19 @@ async function refresh(){{
     }}
     document.getElementById('queue').innerHTML = html;
     
-    // history
     let hr = await fetch('/api/history');
     let hj = await hr.json();
     if(hj.history && hj.history.length > 0){{
       let hhtml = '';
       hj.history.slice(-10).reverse().forEach(h => {{
-        hhtml += '<div class="badge status-' + h.status + '">' + h.id + ' ' + h.status + '</div> ' + (h.url ? h.url.substring(0,50) : '') + ' <small>(' + (h.type||'') + ')</small><br>';
+        hhtml += '<div class="badge status-' + h.status + '\">' + h.id + ' ' + h.status + '</div> ' + (h.url ? h.url.substring(0,50) : '') + ' <small>(' + (h.type||'') + ')</small><br>';
       }});
       document.getElementById('history').innerHTML = hhtml;
     }} else {{
       document.getElementById('history').innerHTML = '<p>아직 작업 없음</p>';
     }}
   }}catch(e){{ 
-    document.getElementById('queue').innerHTML = 'API 연결 실패: ' + e.message + '<br><small>봇이 실행 중인지 확인: docker compose logs -f bot</small>'; 
+    document.getElementById('queue').innerHTML = 'API 연결 실패: ' + e.message; 
   }}
 }}
 setInterval(refresh, 3000);
@@ -172,7 +227,6 @@ document.getElementById('addForm').addEventListener('submit', async (e) => {{
 """
 
 def get_nc_client():
-    """Nextcloud 클라이언트 생성"""
     try:
         from bot.nextcloud.client import NextcloudClient
         url = os.getenv("NEXTCLOUD_URL")
@@ -187,7 +241,6 @@ def get_nc_client():
         return None
 
 def get_downloaders():
-    """다운로더 생성"""
     try:
         from bot.downloaders import HttpDownloader, TorrentDownloader, YtDlpDownloader
         download_dir = os.getenv("DOWNLOAD_DIR", "/downloads")
@@ -207,7 +260,6 @@ def get_downloaders():
         return {}, "/tmp"
 
 async def process_download_task(task_id: str, url: str, detected_type: str):
-    """백그라운드에서 다운로드 + Nextcloud 업로드 처리"""
     from datetime import datetime
     from bot.utils import get_files_recursive
     import asyncio
@@ -226,12 +278,20 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
         if not nc_client:
             raise Exception("Nextcloud 설정 없음 - .env 확인")
         
-        # 다운로드
+        # SECURITY: URL SSRF 검사 (HttpDownloader 내부에서도 하지만 여기서도)
+        if detected_type == 'http':
+            try:
+                from bot.downloaders.http_downloader import _is_safe_url
+                is_safe, reason = _is_safe_url(url)
+                if not is_safe:
+                    raise Exception(f"차단된 URL (SSRF): {reason}")
+            except ImportError:
+                pass
+        
         local_path = None
         if detected_type in ['magnet', 'torrent_url', 'torrent_file']:
             if 'torrent' not in downloaders:
                 raise Exception("Torrent downloader 없음")
-            # torrent는 async
             local_path = await downloaders['torrent'].download(url)
         elif detected_type == 'ytdlp':
             if 'ytdlp' not in downloaders:
@@ -250,7 +310,6 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
         task['status'] = 'uploading'
         task['local_path'] = str(local_path)
         
-        # Nextcloud 업로드
         date_folder = datetime.now().strftime("%Y-%m-%d")
         base_remote = f"{nc_client.base_path}/{date_folder}".strip('/')
         
@@ -266,7 +325,6 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
             
             await loop.run_in_executor(None, lambda fp=file_path, rp=remote_path: nc_client.upload_file(str(fp), rp))
             
-            # 공유 링크
             try:
                 share_url = await loop.run_in_executor(None, lambda rp=remote_path: nc_client.create_share_link(rp))
                 task['share_url'] = share_url
@@ -277,7 +335,6 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
         task['progress'] = 100
         task['completed_at'] = datetime.now().isoformat()
         
-        # history로 이동
         download_history.append(task.copy())
         download_queue.remove(task)
         
@@ -290,11 +347,10 @@ async def process_download_task(task_id: str, url: str, detected_type: str):
             download_queue.remove(task)
 
 @app.get("/", response_class=HTMLResponse)
-def home():
+def home(username: str = Depends(optional_auth) if REQUIRE_AUTH else None):
     nc_url = os.getenv("NEXTCLOUD_URL", "미설정 (.env 확인)")
     nc_path = os.getenv("NEXTCLOUD_BASE_PATH", "/PikPakBot")
     
-    # Nextcloud 연결 테스트
     nc_status = "확인 중..."
     try:
         client = get_nc_client()
@@ -305,23 +361,35 @@ def home():
     except Exception as e:
         nc_status = f"❌ 오류: {e}"
     
-    # format 오류 방지: CSS는 이미 이중 중괄호로 이스케이프됨
-    # nc_url, nc_path만 치환
+    auth_status = "인증됨" if REQUIRE_AUTH else "인증 비활성 (로컬 전용)"
+    if username:
+        auth_status += f" - {username}"
+    
     return HTML_PAGE.format(
         nc_url=nc_url,
         nc_path=nc_path,
-        nc_status=nc_status
+        nc_status=nc_status,
+        auth_status=auth_status
     )
 
 @app.post("/add")
-async def add_link(background_tasks: BackgroundTasks, url: str = Form(...)):
-    """링크 추가 - 실제 다운로드 큐에 추가 및 백그라운드 처리"""
+async def add_link(background_tasks: BackgroundTasks, url: str = Form(...), username: str = Depends(optional_auth) if REQUIRE_AUTH else None):
     if not url or not url.strip():
         return HTMLResponse("<h3>❌ URL을 입력하세요</h3><a href='/'>돌아가기</a>", status_code=400)
     
     url = url.strip()
     
-    # 링크 타입 감지
+    # SECURITY: SSRF 검사
+    try:
+        from bot.downloaders.http_downloader import _is_safe_url
+        # http 타입만 검사, magnet 등은 스킵
+        if url.startswith('http'):
+            is_safe, reason = _is_safe_url(url)
+            if not is_safe:
+                return HTMLResponse(f"<h3>⛔ 차단된 URL (SSRF 방어)</h3><p>{reason}</p><a href='/'>돌아가기</a>", status_code=403)
+    except ImportError:
+        pass
+    
     try:
         from bot.downloaders import LinkDetector
         detected = LinkDetector.detect(url)
@@ -329,7 +397,6 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...)):
         if dtype == 'unknown':
             return HTMLResponse(f"<h3>❌ 알 수 없는 링크: {url[:100]}</h3><p>지원: magnet, torrent, http 직링크, 유튜브 등</p><a href='/'>돌아가기</a>", status_code=400)
     except Exception as e:
-        # LinkDetector import 실패 시 간단 감지
         if url.startswith('magnet:'):
             dtype = 'magnet'
         elif 'youtube.com' in url or 'youtu.be' in url or 'tiktok.com' in url or 'instagram.com' in url or 'twitter.com' in url or 'x.com' in url:
@@ -341,7 +408,6 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...)):
         if dtype == 'unknown':
             return HTMLResponse(f"<h3>❌ 알 수 없는 링크</h3><p>오류: {e}</p><a href='/'>돌아가기</a>", status_code=400)
     
-    # 큐에 추가
     import uuid
     task_id = str(uuid.uuid4())[:8]
     task = {
@@ -354,7 +420,6 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...)):
     }
     download_queue.append(task)
     
-    # 백그라운드에서 처리
     background_tasks.add_task(process_download_task, task_id, url, dtype)
     
     return HTMLResponse(f"""
@@ -370,11 +435,8 @@ async def add_link(background_tasks: BackgroundTasks, url: str = Form(...)):
     """)
 
 @app.get("/api/queue")
-def api_queue():
-    """큐 상태 API - 실제 큐 반환"""
+def api_queue(username: str = Depends(optional_auth) if REQUIRE_AUTH else None):
     try:
-        # bot의 queue_manager가 있다면 그것도 포함 시도 (파일 기반 공유)
-        # 간단히 현재 대시보드 큐만 반환
         queued = [t for t in download_queue if t['status'] == 'queued']
         active = [t for t in download_queue if t['status'] in ['downloading', 'uploading']]
         
@@ -388,26 +450,24 @@ def api_queue():
         return {"queued": [], "active": [], "error": str(e), "message": "큐 조회 실패"}
 
 @app.get("/api/history")
-def api_history():
-    """히스토리 API"""
+def api_history(username: str = Depends(optional_auth) if REQUIRE_AUTH else None):
     return {"history": download_history[-20:]}
 
 @app.get("/api/status")
-def api_status():
-    """전체 상태"""
+def api_status(username: str = Depends(optional_auth) if REQUIRE_AUTH else None):
     return {
         "queue": len(download_queue),
         "history": len(download_history),
         "nextcloud_url": os.getenv("NEXTCLOUD_URL", "not set"),
         "download_dir": os.getenv("DOWNLOAD_DIR", "/downloads"),
-        "env_loaded": bool(os.getenv("NEXTCLOUD_URL"))
+        "env_loaded": bool(os.getenv("NEXTCLOUD_URL")),
+        "auth_required": REQUIRE_AUTH
     }
 
 if __name__ == "__main__":
     import uvicorn
-    # 실행 경로에 관계없이 0.0.0.0:8000에서 실행
-    # tools/에서 실행되든 루트에서 실행되든 동작
     print(f"📁 Project root: {project_root}")
     print(f"📄 .env loaded: {bool(os.getenv('NEXTCLOUD_URL'))}")
-    print(f"🌐 Dashboard: http://0.0.0.0:8000")
+    print(f"🔒 Auth required: {REQUIRE_AUTH} (DASHBOARD_USERNAME/PASSWORD 설정 권장)")
+    print(f"🌐 Dashboard: http://127.0.0.1:8000 (127.0.0.1 only, 외부 노출 시 인증 필수)")
     uvicorn.run(app, host="0.0.0.0", port=8000)

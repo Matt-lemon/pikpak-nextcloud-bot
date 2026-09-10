@@ -1,6 +1,6 @@
-# 대용량 파일 지원 버전 - 로컬 Bot API 서버 포함 (20MB -> 2GB)
+# 대용량 파일 지원 버전 - 로컬 Bot API 서버 포함 (20MB -> 무제한 다운로드, 2GB 업로드)
 # 사용법: docker compose -f docker-compose.ubuntu.large.yml up -d
-# 3.2GB 같은 파일은 여전히 Bot API 2GB 제한 때문에 불가 - UserBot 필요
+# 3.2GB 같은 파일도 로컬 API로 수신 가능 (직접 파일 복사)
 
 services:
   telegram-bot-api:
@@ -14,7 +14,7 @@ services:
     volumes:
       - ./bot-api-data:/var/lib/telegram-bot-api
     ports:
-      - "127.0.0.1:8081:8081"
+      - "127.0.0.1:8081:8081"  # SECURITY: Only localhost
     command: >
       --local
       --http-port 8081
@@ -35,7 +35,8 @@ services:
     container_name: pikpak-aria2
     restart: unless-stopped
     environment:
-      - RPC_SECRET=${ARIA2_SECRET:-mir2mix_pikpak_2024}
+      # SECURITY: No hardcoded default, must be in .env
+      - RPC_SECRET=${ARIA2_SECRET}
       - RPC_PORT=6800
       - LISTEN_PORT=6888
       - IPV6_MODE=false
@@ -44,7 +45,7 @@ services:
       - ./downloads:/downloads
       - ./aria2-config:/config
     ports:
-      - "127.0.0.1:6800:6800"
+      - "127.0.0.1:6800:6800"  # SECURITY: 127.0.0.1 only
       - "6888:6888"
       - "6888:6888/udp"
     networks:
@@ -63,6 +64,7 @@ services:
       - ./downloads:/downloads
       - ./logs:/app/logs
       - ./bot-api-data:/var/lib/telegram-bot-api:ro  # 로컬 Bot API 다운로드 폴더 공유 (다운로드는 제한 없음)
+      - ./config.yaml:/app/config.yaml:ro  # SECURITY FIX: Mount config.yaml
       - /etc/localtime:/etc/localtime:ro
     environment:
       - ARIA2_HOST=http://aria2:6800

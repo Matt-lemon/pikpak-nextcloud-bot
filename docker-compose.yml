@@ -6,14 +6,17 @@ services:
     container_name: pikpak-aria2
     restart: unless-stopped
     environment:
-      - RPC_SECRET=${ARIA2_SECRET:-pikpak_secret}
+      # SECURITY: RPC_SECRET must be set in .env, no default
+      - RPC_SECRET=${ARIA2_SECRET}
       - RPC_PORT=6800
       - LISTEN_PORT=6888
     volumes:
       - ./downloads:/downloads
       - ./aria2-config:/config
     ports:
-      - "6800:6800"
+      # SECURITY FIX: Removed 6800 host exposure - bot accesses via internal network only
+      # Previously: "6800:6800" exposed RPC to all interfaces (Critical)
+      # Now: Only torrent ports exposed, RPC is internal via pikpak-net
       - "6888:6888"
       - "6888:6888/udp"
     networks:
@@ -30,8 +33,11 @@ services:
     volumes:
       - ./downloads:/downloads
       - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro  # SECURITY FIX: Mount config.yaml (was commented out)
+      - /etc/localtime:/etc/localtime:ro
     environment:
       - ARIA2_HOST=http://aria2:6800
+      - TZ=Asia/Seoul
     networks:
       - pikpak-net
 

@@ -1,8 +1,9 @@
 import asyncio
 from collections import deque
-from dataclasses import dataclass
-from typing import Optional, Callable, Awaitable
+from dataclasses import dataclass, field
+from typing import Optional, Callable, Awaitable, List
 import logging
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -17,12 +18,16 @@ class DownloadTask:
     file_path: Optional[str] = None
     error: Optional[str] = None
     progress: float = 0
+    created_at: datetime = field(default_factory=datetime.now)
+    completed_at: Optional[datetime] = None
 
 class QueueManager:
-    def __init__(self, max_concurrent: int = 3):
+    def __init__(self, max_concurrent: int = 3, max_history: int = 100):
         self.queue = deque()
         self.active = {}
+        self.history = deque(maxlen=max_history)  # 완료된 작업 기록
         self.max_concurrent = max_concurrent
+        self.max_history = max_history
         self.lock = asyncio.Lock()
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self._worker_task = None
@@ -41,13 +46,11 @@ class QueueManager:
         while True:
             async with self.lock:
                 if len(self.active) >= self.max_concurrent or not self.queue:
-                    # 대기
                     pass
                 else:
                     task = self.queue.popleft()
                     self.active[task.id] = task
                     logger.info(f"Starting task {task.id}, active: {len(self.active)}/{self.max_concurrent}")
-                    # 세마포어로 동시 실행 제한
                     asyncio.create_task(self._run_task_with_semaphore(task))
             
             await asyncio.sleep(0.5)
@@ -59,8 +62,14 @@ class QueueManager:
                     await self._process_func(task)
             except Exception as e:
                 logger.exception(f"Task {task.id} failed in worker: {e}")
-                self.complete(task.id)
-            # Note: complete()는 process_func 내부에서 호출되거나 여기서 호출
+                task.status = "failed"
+                task.error = str(e)
+                task.completed_at = datetime.now()
+                self._move_to_history(task)
+            finally:
+                # active에서 제거는 complete()에서 하지만, 여기서도 보장
+                if task.id in self.active:
+                    self.complete(task.id)
 
     def get_next(self) -> Optional[DownloadTask]:
         """동기 버전 - 호환성 유지, 하지만 semaphore 사용 권장"""
@@ -73,13 +82,32 @@ class QueueManager:
         return None
 
     def complete(self, task_id: str):
-        self.active.pop(task_id, None)
-        logger.info(f"Task completed: {task_id}, active: {len(self.active)}/{self.max_concurrent}, queued: {len(self.queue)}")
+        """작업 완료 - active에서 제거하고 history로 이동"""
+        task = self.active.pop(task_id, None)
+        if task:
+            if task.status not in ("completed", "failed"):
+                task.status = "completed"
+            task.completed_at = datetime.now()
+            task.progress = 100 if task.status == "completed" else task.progress
+            self._move_to_history(task)
+            logger.info(f"Task completed: {task_id} ({task.status}), active: {len(self.active)}/{self.max_concurrent}, queued: {len(self.queue)}, history: {len(self.history)}")
+        else:
+            # queue에 남아있을 수도 있음 (취소된 경우)
+            # queue에서 제거 시도
+            self.queue = deque([t for t in self.queue if t.id != task_id])
+            logger.info(f"Task {task_id} removed from queue, queued: {len(self.queue)}")
+
+    def _move_to_history(self, task: DownloadTask):
+        """완료된 작업을 history로 이동"""
+        # 중복 방지
+        if not any(t.id == task.id for t in self.history):
+            self.history.append(task)
 
     def get_status_text(self) -> str:
         text = f"📊 큐 상태\n"
         text += f"• 대기 중: {len(self.queue)}개\n"
         text += f"• 진행 중: {len(self.active)}개 / 최대 {self.max_concurrent}개\n"
+        text += f"• 완료됨: {len(self.history)}개 (최근 {min(len(self.history), 5)}개 표시)\n"
         if self.active:
             for t in self.active.values():
                 text += f"  - {t.id} {t.type}: {t.progress:.1f}% ({t.status})\n"
@@ -89,14 +117,31 @@ class QueueManager:
                 text += f"  - {t.id} {t.type}: 대기 중\n"
             if len(self.queue) > 5:
                 text += f"  ... 외 {len(self.queue)-5}개\n"
+        if self.history:
+            text += f"• 최근 완료:\n"
+            for t in list(self.history)[-5:]:
+                status_icon = "✅" if t.status == "completed" else "❌"
+                text += f"  {status_icon} {t.id} {t.type}: {t.status}\n"
         return text
+
+    def get_queue_info(self) -> dict:
+        """API용 큐 정보"""
+        return {
+            "queued": [{"id": t.id, "type": t.type, "url": t.url[:100], "status": t.status} for t in self.queue],
+            "active": [{"id": t.id, "type": t.type, "url": t.url[:100], "status": t.status, "progress": t.progress} for t in self.active.values()],
+            "history": [{"id": t.id, "type": t.type, "status": t.status, "completed_at": t.completed_at.isoformat() if t.completed_at else None} for t in list(self.history)[-10:]],
+            "max_concurrent": self.max_concurrent
+        }
 
     # 간단한 동시 실행 제한을 위한 세마포어 기반 실행
     async def run_with_limit(self, task: DownloadTask, coro):
-        """세마포어로 제한된 실행"""
+        """세마포어로 제한된 실행 - 큐에서 제거하고 active로 이동 후 실행"""
         async with self.semaphore:
             async with self.lock:
+                # queue에서 제거 (이미 add()로 추가된 경우)
+                self.queue = deque([t for t in self.queue if t.id != task.id])
                 self.active[task.id] = task
+                logger.info(f"Task {task.id} started with semaphore, active: {len(self.active)}/{self.max_concurrent}")
             try:
                 return await coro
             finally:

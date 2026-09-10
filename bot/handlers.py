@@ -145,11 +145,32 @@ def init_managers(config):
     logger.info(f"✅ Config applied: max_file={max_file_gb}GB, share_link={create_share}, date_folder={CONFIG['_auto_date_folder']}, progress_every={CONFIG['_progress_every']}%")
 
 def check_permission(user_id: int) -> bool:
-    allowed = os.getenv("ALLOWED_USER_IDS", "")
+    """
+    SECURITY FIX: ALLOWED_USER_IDS가 비어있으면 기본적으로 거부
+    기존: 비어있으면 True 반환 -> 모든 사용자 허용 (Critical)
+    수정: 비어있으면 ALLOW_UNAUTHENTICATED=true일 때만 허용, 아니면 거부
+    """
+    allowed = os.getenv("ALLOWED_USER_IDS", "").strip()
     if not allowed:
-        return True
-    allowed_ids = [int(x.strip()) for x in allowed.split(",") if x.strip()]
-    return user_id in allowed_ids
+        # main.py에서 이미 검사하지만, 여기서도 방어
+        allow_unauth = os.getenv("ALLOW_UNAUTHENTICATED", "false").lower() in ("true", "1", "yes")
+        if allow_unauth:
+            logger.warning(f"⚠️ SECURITY: ALLOWED_USER_IDS 비어있음 + ALLOW_UNAUTHENTICATED=true -> 사용자 {user_id} 허용 (비권장)")
+            return True
+        else:
+            logger.warning(f"⛔ SECURITY: ALLOWED_USER_IDS 비어있음 -> 사용자 {user_id} 거부 (Critical fix)")
+            return False
+    
+    try:
+        allowed_ids = [int(x.strip()) for x in allowed.split(",") if x.strip() and x.strip().isdigit()]
+        # 템플릿 값 필터링
+        if not allowed_ids:
+            # 숫자가 하나도 없으면 (템플릿 값만 있으면) 거부
+            return False
+        return user_id in allowed_ids
+    except Exception as e:
+        logger.error(f"ALLOWED_USER_IDS 파싱 실패: {e}")
+        return False
 
 def _check_file_size_allowed(file_size: int) -> tuple[bool, str]:
     """config.yaml의 max_file_size_gb 검사"""
@@ -367,11 +388,40 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         download_dir = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
         download_dir.mkdir(parents=True, exist_ok=True)
+        download_root_resolved = download_dir.resolve()
         
-        # 로컬 파일인지 확인
+        # SECURITY FIX: /sendlarge 로컬 경로 Path Traversal 방지 (Critical)
+        # 기존: Path(file_path_str)이 존재하면 그대로 전송 -> /etc/hostname 등 읽기 가능
+        # 수정: DOWNLOAD_DIR 내부 파일만 허용
         local_path = Path(file_path_str)
         is_nextcloud_path = False
         remote_path_for_download = file_path_str
+        
+        # 로컬 파일 경로 검증
+        if local_path.exists():
+            try:
+                resolved = local_path.resolve()
+                # DOWNLOAD_DIR 내부인지 확인
+                if resolved != download_root_resolved and download_root_resolved not in resolved.parents:
+                    # DOWNLOAD_DIR 외부 파일은 보안상 거부
+                    # 단, 명시적으로 허용된 경로는 예외 처리 가능 (현재는 거부)
+                    await context.bot.edit_message_text(
+                        chat_id=update.effective_chat.id,
+                        message_id=status_msg.message_id,
+                        text=f"⛔ **보안 차단**\n"
+                             f"요청한 파일이 다운로드 폴더 외부에 있습니다:\n"
+                             f"`{file_path_str}`\n\n"
+                             f"보안상 `/sendlarge`는 `{download_dir}` 내부 파일만 전송할 수 있습니다.\n"
+                             f"Nextcloud 경로는 `/PikPakBot/...` 형식으로 입력하세요.\n"
+                             f"예: `/sendlarge /PikPakBot/2026-09-10/video.mp4`",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                    logger.warning(f"⛔ SECURITY: /sendlarge 외부 경로 접근 시도 차단: {file_path_str} -> {resolved} (사용자: {update.effective_user.id})")
+                    return
+            except Exception as e:
+                logger.warning(f"경로 검증 실패, Nextcloud 경로로 간주: {e}")
+                # 검증 실패 시 Nextcloud 경로로 처리
+                local_path = Path("/nonexistent")  # 존재하지 않는 것으로 만들어 Nextcloud 다운로드 경로로 유도
         
         if not local_path.exists():
             # Nextcloud 경로로 간주 - WebDAV 다운로드 구현
@@ -480,7 +530,9 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         if file_size <= SPLIT_CHUNK_SIZE:
-            # 작은 파일은 스트리밍으로 전송 (메모리 효율)
+            # 작은 파일은 스트리밍으로 전송 (메모리 효율) - PTB 20.7 OOM fix
+            # 기존: with open() as f: send_document(document=f) -> PTB 20.7에서 전체 메모리 로드 (OOM)
+            # 수정: PTB 21.5+ InputFile(read_file_handle=False) 또는 수동 HTTP 스트리밍 사용
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,
                 message_id=status_msg.message_id,
@@ -490,24 +542,59 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN
             )
             
-            # 메모리 효율적 전송: InputFile 대신 파일 객체를 with로 열어 스트리밍
-            # python-telegram-bot은 파일 객체를 청크 단위로 읽어 전송 (전체 메모리 로드 방지)
-            loop = asyncio.get_event_loop()
-            def _send_small():
-                # 별도 스레드에서 동기적으로 열 필요 없음 - 그냥 파일 객체 전달
-                # 하지만 여기서는 executor에서 실행하지 않고 직접 호출
-                # 실제 전송은 async
-                return local_path
-            
-            # 스트리밍 전송: 파일 객체를 직접 전달 (메모리에 전체 로드 안 함)
-            # 1.99GB 파일도 8MB씩 읽어서 전송
-            with open(local_path, 'rb') as f:
-                await context.bot.send_document(
-                    chat_id=update.effective_chat.id,
-                    document=f,
-                    filename=local_path.name,
-                    caption=f"{local_path.name} ({format_size(file_size)})"
-                )
+            # SECURITY FIX: PTB 21.5+ 스트리밍 전송 (OOM 방지)
+            # InputFile with read_file_handle=False는 파일을 메모리에 전부 로드하지 않고 스트리밍
+            try:
+                # PTB 21.5+ 방식: InputFile을 사용하여 스트리밍
+                from telegram import InputFile
+                # PTB 버전에 따라 read_file_handle 파라미터가 있을 수도 없을 수도 있음
+                try:
+                    # PTB 21.5+ - read_file_handle=False로 스트리밍
+                    input_file = InputFile(local_path, filename=local_path.name, read_file_handle=False)
+                except TypeError:
+                    # PTB 20.7 - read_file_handle 파라미터 없음, fallback to manual streaming
+                    # 수동 HTTP 스트리밍 (tools/telegram_large_file.py의 BotAPI 사용)
+                    if HAS_LARGE_INTEGRATION:
+                        logger.info(f"PTB 20.7 fallback: 수동 스트리밍으로 {local_path.name} 전송")
+                        # BotAPI 직접 사용 - 1MB 버퍼 스트리밍
+                        loop = asyncio.get_event_loop()
+                        def _manual_send():
+                            token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+                            api_base = os.getenv("TELEGRAM_BOT_API_URL", "http://127.0.0.1:8081").strip()
+                            from tools.telegram_large_file import BotAPI, signature
+                            api = BotAPI(api_base, token)
+                            sig = signature(local_path)
+                            result = api.send_document(
+                                local_path, 0, file_size, local_path.name,
+                                str(update.effective_chat.id),
+                                f"{local_path.name} ({format_size(file_size)})",
+                                expected_signature=sig
+                            )
+                            return result
+                        await loop.run_in_executor(None, _manual_send)
+                        input_file = None  # 이미 전송됨
+                    else:
+                        # 최후 fallback: 기존 방식 (메모리 위험 있지만 어쩔 수 없음)
+                        logger.warning(f"PTB 20.7 + 대용량 모듈 없음, 메모리 로드 위험: {local_path.name}")
+                        input_file = InputFile(local_path, filename=local_path.name)
+                
+                if input_file is not None:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=input_file,
+                        filename=local_path.name,
+                        caption=f"{local_path.name} ({format_size(file_size)})"
+                    )
+            except Exception as e:
+                # fallback: 기존 방식
+                logger.warning(f"스트리밍 전송 실패, fallback: {e}")
+                with open(local_path, 'rb') as f:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=f,
+                        filename=local_path.name,
+                        caption=f"{local_path.name} ({format_size(file_size)})"
+                    )
             
             await context.bot.edit_message_text(
                 chat_id=update.effective_chat.id,

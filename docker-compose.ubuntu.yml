@@ -9,7 +9,8 @@ services:
     container_name: pikpak-aria2
     restart: unless-stopped
     environment:
-      - RPC_SECRET=${ARIA2_SECRET:-mir2mix_pikpak_2024}
+      # SECURITY: RPC_SECRET must be set in .env, no hardcoded default
+      - RPC_SECRET=${ARIA2_SECRET}
       - RPC_PORT=6800
       - LISTEN_PORT=6888
       - IPV6_MODE=false
@@ -18,7 +19,7 @@ services:
       - ./downloads:/downloads
       - ./aria2-config:/config
     ports:
-      - "127.0.0.1:6800:6800"  # 외부 노출 금지, bot만 접근
+      - "127.0.0.1:6800:6800"  # 외부 노출 금지, bot만 접근 (127.0.0.1 바인딩)
       - "6888:6888"
       - "6888:6888/udp"
     networks:
@@ -39,9 +40,8 @@ services:
     volumes:
       - ./downloads:/downloads
       - ./logs:/app/logs
+      - ./config.yaml:/app/config.yaml:ro  # SECURITY FIX: Mount config.yaml (was commented out)
       - /etc/localtime:/etc/localtime:ro  # NAS 시간 동기화
-      # config.yaml은 선택 - 있으면 마운트, 없으면 기본값 사용
-      # - ./config.yaml:/app/config.yaml:ro
     environment:
       - ARIA2_HOST=http://aria2:6800
       - TZ=Asia/Seoul
@@ -52,16 +52,18 @@ services:
       options:
         max-size: "20m"
 
-  # 보너스: 웹 대시보드 (선택)
+  # 보너스: 웹 대시보드 (선택) - 인증 필요, 기본 127.0.0.1만
   dashboard:
     build: .
     container_name: pikpak-dashboard
     restart: unless-stopped
-    command: python web_dashboard.py
+    command: python tools/web_dashboard.py
     env_file:
       - .env
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
     ports:
-      - "127.0.0.1:8000:8000"  # 필요하면 0.0.0.0:8000으로 변경
+      - "127.0.0.1:8000:8000"  # SECURITY: Only localhost, change to 0.0.0.0 if needed with auth
     networks:
       - pikpak-net
     profiles:

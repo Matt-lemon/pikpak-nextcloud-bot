@@ -121,6 +121,16 @@ def main():
         logger.info(f"ℹ️ 공식 Bot API 사용 (다운로드 20MB 제한, 대용량은 로컬 API 필요)")
         app = Application.builder().token(token).request(request).build()
 
+    # 에러 핸들러 (봇 크래시 방지)
+    async def error_handler(update, context):
+        logger.error(f"Exception while handling an update: {context.error}", exc_info=context.error)
+        # 사용자에게 간단한 에러 메시지 (선택)
+        try:
+            if update and update.effective_message:
+                await update.effective_message.reply_text(f"❌ 오류 발생: {str(context.error)[:200]}")
+        except:
+            pass
+
     # 핸들러 등록
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
@@ -138,6 +148,9 @@ def main():
     app.add_handler(MessageHandler(filters.ANIMATION, handle_animation))
     # 문서와 텍스트는 마지막에 (모든 파일 + 링크)
     app.add_handler(MessageHandler(filters.Document.ALL | filters.TEXT, handle_message))
+    
+    # 에러 핸들러 등록 (마지막에)
+    app.add_error_handler(error_handler)
 
     logger.info("🚀 PikPak Clone Bot 시작!")
     logger.info(f"Nextcloud: {os.getenv('NEXTCLOUD_URL')} -> {os.getenv('NEXTCLOUD_BASE_PATH')}")

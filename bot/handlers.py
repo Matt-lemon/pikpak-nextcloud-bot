@@ -172,6 +172,58 @@ def check_permission(user_id: int) -> bool:
         logger.error(f"ALLOWED_USER_IDS 파싱 실패: {e}")
         return False
 
+def _is_forwarded_message(message) -> bool:
+    """
+    PTB 20.7~22.8 호환: 전달된 메시지인지 확인
+    - PTB 20.7: forward_from, forward_from_chat, forward_date
+    - PTB 21.5+ / Bot API 7.0+: forward_origin
+    - AttributeError 방지: getattr 사용
+    """
+    if not message:
+        return False
+    # Old API
+    if getattr(message, 'forward_from', None):
+        return True
+    if getattr(message, 'forward_from_chat', None):
+        return True
+    if getattr(message, 'forward_date', None):
+        return True
+    # New API (Bot API 7.0+)
+    if getattr(message, 'forward_origin', None):
+        return True
+    return False
+
+def _get_forward_info(message) -> str:
+    """전달된 메시지 출처 정보 반환 (PTB 호환)"""
+    if not message:
+        return ""
+    try:
+        # Old API
+        fwd_from = getattr(message, 'forward_from', None)
+        if fwd_from:
+            return f" from {getattr(fwd_from, 'full_name', str(fwd_from))}"
+        
+        fwd_chat = getattr(message, 'forward_from_chat', None)
+        if fwd_chat:
+            return f" from {getattr(fwd_chat, 'title', str(fwd_chat))}"
+        
+        # New API
+        fwd_origin = getattr(message, 'forward_origin', None)
+        if fwd_origin:
+            # forward_origin can be MessageOriginUser, MessageOriginChat, etc
+            if hasattr(fwd_origin, 'sender_user') and fwd_origin.sender_user:
+                return f" from {getattr(fwd_origin.sender_user, 'full_name', 'user')}"
+            if hasattr(fwd_origin, 'chat') and fwd_origin.chat:
+                return f" from {getattr(fwd_origin.chat, 'title', 'chat')}"
+            if hasattr(fwd_origin, 'sender_user_name') and fwd_origin.sender_user_name:
+                return f" from {fwd_origin.sender_user_name}"
+            if hasattr(fwd_origin, 'sender_chat') and fwd_origin.sender_chat:
+                return f" from {getattr(fwd_origin.sender_chat, 'title', 'chat')}"
+            return " (forwarded)"
+    except Exception as e:
+        logger.debug(f"get_forward_info failed: {e}")
+    return ""
+
 def _check_file_size_allowed(file_size: int) -> tuple[bool, str]:
     """config.yaml의 max_file_size_gb 검사"""
     max_bytes = CONFIG.get('_max_file_bytes', 20 * 1024**3)
@@ -681,14 +733,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ 권한이 없습니다.")
         return
 
-    # 전달된 메시지 표시
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat or update.message.forward_date)
-    forward_info = ""
+    # 전달된 메시지 표시 - PTB 20.7~22.8 호환
+    is_forwarded = _is_forwarded_message(update.message)
+    forward_info = _get_forward_info(update.message) if is_forwarded else ""
     if is_forwarded:
-        if update.message.forward_from:
-            forward_info = f" from {update.message.forward_from.full_name}"
-        elif update.message.forward_from_chat:
-            forward_info = f" from {update.message.forward_from_chat.title}"
         logger.info(f"Forwarded message detected{forward_info}")
 
     text = update.message.text or update.message.caption or ""
@@ -769,7 +817,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_permission(update.effective_user.id):
         return
     video = update.message.video
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat)
+    is_forwarded = _is_forwarded_message(update.message)
     file_name = video.file_name or f"video_{video.file_id}.mp4"
     if video.file_size:
         ok, msg = _check_file_size_allowed(video.file_size)
@@ -783,7 +831,7 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_permission(update.effective_user.id):
         return
     audio = update.message.audio
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat)
+    is_forwarded = _is_forwarded_message(update.message)
     file_name = audio.file_name or f"audio_{audio.file_id}.mp3"
     if audio.file_size:
         ok, msg = _check_file_size_allowed(audio.file_size)
@@ -800,7 +848,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not photos:
         return
     photo = photos[-1]
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat)
+    is_forwarded = _is_forwarded_message(update.message)
     file_name = f"photo_{photo.file_id}.jpg"
     await handle_telegram_media(update, context, photo.file_id, file_name, photo.file_size, "photo", is_forwarded)
 
@@ -809,7 +857,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_permission(update.effective_user.id):
         return
     voice = update.message.voice
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat)
+    is_forwarded = _is_forwarded_message(update.message)
     file_name = f"voice_{voice.file_id}.ogg"
     await handle_telegram_media(update, context, voice.file_id, file_name, voice.file_size, "voice", is_forwarded)
 
@@ -818,7 +866,7 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_permission(update.effective_user.id):
         return
     vn = update.message.video_note
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat)
+    is_forwarded = _is_forwarded_message(update.message)
     file_name = f"video_note_{vn.file_id}.mp4"
     await handle_telegram_media(update, context, vn.file_id, file_name, vn.file_size, "video_note", is_forwarded)
 
@@ -827,7 +875,7 @@ async def handle_animation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not check_permission(update.effective_user.id):
         return
     anim = update.message.animation
-    is_forwarded = bool(update.message.forward_from or update.message.forward_from_chat)
+    is_forwarded = _is_forwarded_message(update.message)
     file_name = anim.file_name or f"animation_{anim.file_id}.mp4"
     if anim.file_size:
         ok, msg = _check_file_size_allowed(anim.file_size)

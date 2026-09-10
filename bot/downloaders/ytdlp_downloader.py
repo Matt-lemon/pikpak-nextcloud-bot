@@ -147,9 +147,12 @@ class YtDlpDownloader:
                     fp = Path(rd.get('filepath', ''))
                     if fp.exists():
                         # 다운로드 후 크기 재검사
-                        if max_file_size and fp.stat().st_size > max_file_size:
+                        # ROUND-3 FIX: 삭제 후 stat()하면 FileNotFoundError가 발생하므로
+                        # 크기를 먼저 읽어둠.
+                        actual_size = fp.stat().st_size
+                        if max_file_size and actual_size > max_file_size:
                             fp.unlink(missing_ok=True)
-                            raise Exception(f"다운로드된 파일 크기 {fp.stat().st_size}가 최대 {max_file_size} 초과 - 삭제됨")
+                            raise Exception(f"다운로드된 파일 크기 {actual_size}가 최대 {max_file_size} 초과 - 삭제됨")
                         logger.info(f"yt-dlp final file from requested_downloads: {fp}")
                         return fp
                 fp = Path(info['requested_downloads'][0].get('filepath', ''))

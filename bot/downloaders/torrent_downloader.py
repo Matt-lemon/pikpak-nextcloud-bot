@@ -70,7 +70,36 @@ class TorrentDownloader:
             elif magnet_or_url.startswith("magnet:"):
                 download = self.client.add_magnet(magnet_or_url, options=options)
             elif magnet_or_url.lower().endswith('.torrent') and magnet_or_url.startswith(('http://', 'https://')):
-                download = self.client.add_uris([magnet_or_url], options=options)
+                # ROUND-3 FIX: 원격 .torrent URL을 aria2에 직접 주지 않음.
+                # - 이유: aria2가 redirect를 자체 처리하므로 Python SSRF 검사가
+                #   첫 hop만 보고 우회됨 (302 -> 내부 IP 가능).
+                # - 수정: 검증된 HttpDownloader로 .torrent를 먼저 받아서
+                #   로컬 파일로 add_torrent() 등록. (redirect 전수 통제)
+                from .http_downloader import HttpDownloader
+                _http = HttpDownloader(str(self.download_dir))
+                torrent_file = await _http.download(
+                    magnet_or_url,
+                    max_file_size=100 * 1024 * 1024,  # .torrent 메타파일 상한 100MB
+                )
+                # 최소 형식 검증: bencode dict는 'd'로 시작
+                try:
+                    with open(torrent_file, 'rb') as _tf:
+                        _magic = _tf.read(1)
+                    if _magic != b'd':
+                        raise ValueError(f".torrent 형식이 아님 (magic={_magic!r})")
+                except Exception:
+                    try:
+                        Path(torrent_file).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    raise
+                logger.info(f"Aria2 add_torrent via local file: {torrent_file}")
+                download = self.client.add_torrent(str(torrent_file), options=options)
+                # 등록 성공 후 임시 .torrent는 정리 (aria2 RPC로 메타 전송済)
+                try:
+                    Path(torrent_file).unlink(missing_ok=True)
+                except Exception:
+                    pass
             else:
                 download = self.client.add_uris([magnet_or_url], options=options)
         except Exception as e:

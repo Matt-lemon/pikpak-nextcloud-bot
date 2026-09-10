@@ -12,11 +12,18 @@ logger = logging.getLogger(__name__)
 
 class NextcloudClient:
     """PikPak처럼 Nextcloud WebDAV + OCS Share API 연동 - v2 Chunking 공식 규격 준수"""
-    def __init__(self, url: str, username: str, password: str, base_path: str = "/PikPakBot", chunk_size: int = 10*1024*1024, timeout: int = 300):
+    def __init__(self, url: str, username: str, password: str, base_path: str = "/PikPakBot", chunk_size: int = 10*1024*1024, timeout: int = 300, share_permissions: int = 1):
         self.url = url.rstrip('/')
         self.username = username
         self.password = password
         self.base_path = base_path.strip('/')
+        # ROUND-3 FIX: 공유 권한을 생성자로 받음 (기존엔 config를 읽고도 OCS 호출에
+        # 하드코딩 1을 써서 설정이 무시됐음). OCS 권한 비트마스크 1~31, 범위 밖은 1.
+        try:
+            _perm = int(share_permissions)
+        except (TypeError, ValueError):
+            _perm = 1
+        self.share_permissions = _perm if 1 <= _perm <= 31 else 1
         self.chunk_size = chunk_size
         self.timeout = timeout  # Nextcloud 요청 타임아웃 (초) - 무응답 방지
         self.webdav_url = f"{self.url}/remote.php/dav/files/{self.username}"
@@ -201,7 +208,7 @@ class NextcloudClient:
         data = {
             "path": remote_path,
             "shareType": 3,
-            "permissions": 1
+            "permissions": getattr(self, 'share_permissions', 1)
         }
         resp = self.session.post(self.ocs_url, data=data, headers={"OCS-APIREQUEST": "true", "Accept": "application/json"}, timeout=self.timeout)
         try:

@@ -5,10 +5,10 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from .handlers import (
-    start_command, help_command, status_command, list_command, 
+    start_command, help_command, status_command, list_command,
     merge_command, sendlarge_command,
-    handle_message, init_managers,
-    handle_video, handle_audio, handle_photo, handle_voice, 
+    handle_message, init_managers, purge_old_downloads,
+    handle_video, handle_audio, handle_photo, handle_voice,
     handle_video_note, handle_animation
 )
 
@@ -102,6 +102,12 @@ def main():
     
     init_managers(config)
 
+    # ROUND-3: 시작 시 오래된 다운로드 정리 (CLEANUP_MAX_AGE_DAYS>0일 때만)
+    try:
+        purge_old_downloads()
+    except Exception as e:
+        logger.warning(f"시작 정리 실패 (무시): {e}")
+
     # 텔레그램 앱 생성 - 로컬 Bot API 지원 (다운로드 무제한, 업로드 2,000MB)
     # 공식 문서: 로컬 API는 다운로드 제한 없음, 업로드는 2,000MB
     bot_api_url = os.getenv("TELEGRAM_BOT_API_URL", "")
@@ -111,6 +117,10 @@ def main():
         connection_pool_size=20,
         read_timeout=7200,  # 2시간 - 3.2GB 다운로드 준비 시간
         write_timeout=7200,
+        # ROUND-3 FIX: 미디어 업로드 타임아웃 (PTB 21.5+부터 파일 첨부 시
+        # write_timeout이 아니라 media_write_timeout 사용, 기본값 20초!)
+        # 미설정 시 대용량 /sendlarge가 20초 만에 타임아웃됨.
+        media_write_timeout=7200,
         connect_timeout=60,
         pool_timeout=60
     )

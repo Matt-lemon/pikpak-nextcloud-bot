@@ -188,9 +188,11 @@ class HttpDownloader:
         effective_max = max_file_size or self.max_file_size
         if effective_max is None:
             # 환경변수나 config에서 읽기 시도
+            # ROUND-3 FIX: HTTP 전용 상한을 전역 상한보다 우선 적용.
+            # 기존 순서는 전역값이 항상 존재하므로 HTTP 전용값이 묻혔음.
             try:
                 from ..handlers import CONFIG
-                effective_max = CONFIG.get('_max_file_bytes') or CONFIG.get('_http_max_bytes')
+                effective_max = CONFIG.get('_http_max_bytes') or CONFIG.get('_max_file_bytes')
             except:
                 pass
         

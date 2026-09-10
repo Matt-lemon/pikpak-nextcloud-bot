@@ -89,11 +89,11 @@ def init_managers(config):
         username=os.getenv("NEXTCLOUD_USERNAME"),
         password=os.getenv("NEXTCLOUD_PASSWORD"),
         base_path=os.getenv("NEXTCLOUD_BASE_PATH", "/PikPakBot"),
-        chunk_size=int(os.getenv("NEXTCLOUD_CHUNK_SIZE", 10*1024*1024))
+        chunk_size=int(os.getenv("NEXTCLOUD_CHUNK_SIZE", 10*1024*1024)),
+        share_permissions=CONFIG['_share_permissions'],  # ROUND-3: 생성자로 전달 (기존 무시됨)
     )
     # NextcloudClient에 config 전달 (공유 링크 비활성화 등)
     nc_client.create_share_enabled = CONFIG['_create_share_link']
-    nc_client.share_permissions = CONFIG['_share_permissions']
     
     # --- 다운로드 설정 ---
     download_dir = os.getenv("DOWNLOAD_DIR", "/downloads")
@@ -102,36 +102,51 @@ def init_managers(config):
     torrent_cfg = download_cfg.get('torrent', {})
     ytdlp_cfg = download_cfg.get('ytdlp', {})
     
+    # ROUND-3 FIX: 다운로더별 max_size/format을 생성자로 전달.
+    # - 기존 버그 1: ytdlp format은 hasattr(obj, 'format')이 항상 False라
+    #   (실제 속성명은 format_str) config가 절대 적용되지 않았음.
+    # - 기존 버그 2: torrent/ytdlp의 max_size를 읽지 않아 전역값만 사용됨.
+    def _opt_bytes(cfg: dict, key: str):
+        v = cfg.get(key)
+        if not v:
+            return None
+        b = _parse_size_to_bytes(v)
+        return b if b > 0 else None
+
     # http.enabled
     if http_cfg.get('enabled', True):
-        downloaders['http'] = HttpDownloader(download_dir)
-        # max_size 적용
-        http_max = http_cfg.get('max_size')
+        http_max = _opt_bytes(http_cfg, 'max_size')
+        downloaders['http'] = HttpDownloader(download_dir, max_file_size=http_max)
         if http_max:
-            CONFIG['_http_max_bytes'] = _parse_size_to_bytes(http_max)
-        logger.info(f"✅ HTTP downloader enabled (max: {http_cfg.get('max_size', 'unlimited')})")
+            CONFIG['_http_max_bytes'] = http_max
+        logger.info(f"✅ HTTP downloader enabled (max: {http_cfg.get('max_size', 'global')})")
     else:
         logger.info("⏭️ HTTP downloader disabled by config.yaml")
-    
+
     # torrent.enabled
     if torrent_cfg.get('enabled', True):
+        torrent_max = _opt_bytes(torrent_cfg, 'max_size')
         downloaders['torrent'] = TorrentDownloader(
-            download_dir, 
+            download_dir,
             os.getenv("ARIA2_HOST", "http://aria2:6800"),
-            os.getenv("ARIA2_SECRET", "")
+            os.getenv("ARIA2_SECRET", ""),
+            max_file_size=torrent_max,
         )
-        logger.info("✅ Torrent downloader enabled")
+        logger.info(f"✅ Torrent downloader enabled (max: {torrent_cfg.get('max_size', 'global')})")
     else:
         logger.info("⏭️ Torrent downloader disabled by config.yaml")
-    
+
     # ytdlp.enabled
     if ytdlp_cfg.get('enabled', True):
-        downloaders['ytdlp'] = YtDlpDownloader(download_dir)
-        # format 적용 (yt-dlp downloader가 지원하면)
-        ytdlp_format = ytdlp_cfg.get('format')
-        if ytdlp_format and hasattr(downloaders['ytdlp'], 'format'):
-            downloaders['ytdlp'].format = ytdlp_format
-        logger.info(f"✅ yt-dlp downloader enabled (format: {ytdlp_cfg.get('format', 'best')})")
+        ytdlp_format = ytdlp_cfg.get('format') or None
+        ytdlp_max = _opt_bytes(ytdlp_cfg, 'max_size')
+        _ytdlp_kwargs = {}
+        if ytdlp_format:
+            _ytdlp_kwargs['format_str'] = ytdlp_format
+        if ytdlp_max:
+            _ytdlp_kwargs['max_file_size'] = ytdlp_max
+        downloaders['ytdlp'] = YtDlpDownloader(download_dir, **_ytdlp_kwargs)
+        logger.info(f"✅ yt-dlp downloader enabled (format: {ytdlp_format or 'default'}, max: {ytdlp_cfg.get('max_size', 'global')})")
     else:
         logger.info("⏭️ yt-dlp downloader disabled by config.yaml")
     
@@ -224,15 +239,114 @@ def _get_forward_info(message) -> str:
         logger.debug(f"get_forward_info failed: {e}")
     return ""
 
-def _check_file_size_allowed(file_size: int) -> tuple[bool, str]:
-    """config.yaml의 max_file_size_gb 검사"""
+def _cleanup_after_upload_enabled() -> bool:
+    return os.getenv("CLEANUP_AFTER_UPLOAD", "false").lower() in ("true", "1", "yes")
+
+def _cleanup_max_age_days() -> int:
+    try:
+        return max(0, int(os.getenv("CLEANUP_MAX_AGE_DAYS", "0") or 0))
+    except ValueError:
+        return 0
+
+# /merge 복원에 필요하므로 업로드 직후 정리에서는 보존하는 패턴
+_MERGE_KEEP_PATTERNS = (".part_", ".tgparts.json", ".manifest.json")
+
+def cleanup_local_paths(paths) -> int:
+    """업로드 성공 후 로컬 파일 정리 (CLEANUP_AFTER_UPLOAD=true일 때만 동작).
+
+    ROUND-3: 장기 운영 시 /downloads 무한 증가 방지.
+    안전장치: DOWNLOAD_DIR 밖은 절대 삭제 금지, 분할/복원 파일은 보존.
+    """
+    if not _cleanup_after_upload_enabled():
+        return 0
+    import shutil
+    try:
+        download_root = Path(os.getenv("DOWNLOAD_DIR", "/downloads")).resolve()
+    except Exception:
+        return 0
+    removed = 0
+    for raw in paths or []:
+        try:
+            p = Path(raw).resolve()
+            if p == download_root or download_root not in p.parents:
+                continue
+            if any(pat in p.name for pat in _MERGE_KEEP_PATTERNS):
+                continue
+            if p.is_symlink():
+                continue
+            if p.is_file():
+                p.unlink(missing_ok=True)
+                removed += 1
+            elif p.is_dir():
+                has_parts = any(
+                    pat in q.name for q in p.rglob('*') for pat in _MERGE_KEEP_PATTERNS
+                )
+                if has_parts:
+                    for q in p.rglob('*'):
+                        if q.is_symlink():
+                            continue
+                        if q.is_file() and not any(pat in q.name for pat in _MERGE_KEEP_PATTERNS):
+                            q.unlink(missing_ok=True)
+                            removed += 1
+                else:
+                    shutil.rmtree(p, ignore_errors=True)
+                    removed += 1
+        except Exception as e:
+            logger.warning(f"로컬 정리 실패 {raw}: {e}")
+    if removed:
+        logger.info(f"🧹 업로드 후 로컬 정리: {removed}개 삭제")
+    return removed
+
+def purge_old_downloads() -> int:
+    """CLEANUP_MAX_AGE_DAYS 초과 파일 정리 (0이면 비활성).
+    시작 시 + 작업 성공 시 호출. 심볼릭링크는 건드리지 않음."""
+    max_days = _cleanup_max_age_days()
+    if max_days <= 0:
+        return 0
+    import time
+    download_root = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
+    if not download_root.is_dir():
+        return 0
+    cutoff = time.time() - max_days * 86400
+    removed = 0
+    try:
+        for q in download_root.rglob('*'):
+            try:
+                if q.is_symlink():
+                    continue
+                if q.is_file() and q.stat().st_mtime < cutoff:
+                    q.unlink(missing_ok=True)
+                    removed += 1
+            except Exception:
+                continue
+        for q in sorted(download_root.rglob('*'), reverse=True):
+            try:
+                if q.is_dir() and not q.is_symlink() and not any(q.iterdir()):
+                    q.rmdir()
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"오래된 파일 정리 실패: {e}")
+    if removed:
+        logger.info(f"🧹 {max_days}일 초과 파일 정리: {removed}개 삭제")
+    return removed
+
+def _check_file_size_allowed(file_size: int, source: str = "telegram") -> tuple[bool, str]:
+    """출처별 크기 제한 검사.
+    ROUND-3 FIX: 기존에는 HTTP 전용 상한을 텔레그램 수신 파일에도 적용했음
+    (예: http.max_size=1GB면 텔레그램 2GB 파일까지 거부). 이제 출처별로 분리.
+    - source='http': HTTP 전용 상한 우선, 없으면 전역 상한
+    - 그 외: 전역 상한만 (torrent/ytdlp 전용 상한은 각 다운로더 내부에서 검사)
+    """
+    if file_size is None:
+        return True, ""
+    if source == "http":
+        http_max = CONFIG.get('_http_max_bytes')
+        if http_max and file_size > http_max:
+            return False, f"파일 크기 {format_size(file_size)}가 HTTP 최대 {format_size(http_max)}를 초과합니다."
     max_bytes = CONFIG.get('_max_file_bytes', 20 * 1024**3)
     if file_size > max_bytes:
         return False, f"파일 크기 {format_size(file_size)}가 최대 허용 {format_size(max_bytes)}를 초과합니다. config.yaml bot.max_file_size_gb를 확인하세요."
-    # http max_size도 검사
-    http_max = CONFIG.get('_http_max_bytes')
-    if http_max and file_size > http_max:
-        return False, f"파일 크기 {format_size(file_size)}가 HTTP 최대 {format_size(http_max)}를 초과합니다."
     return True, ""
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -631,21 +745,30 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode=ParseMode.MARKDOWN
             )
             
-            # SECURITY FIX: PTB 21.5+ 스트리밍 전송 (OOM 방지)
-            # InputFile with read_file_handle=False는 파일을 메모리에 전부 로드하지 않고 스트리밍
+            # ROUND-3 FIX: PTB InputFile에는 Path가 아니라 *열린 파일 핸들* 전달.
+            # - PTB 문서: obj는 file object | bytes | str. Path를 주면
+            #   read_file_handle=False일 때 Path 객체가 그대로 httpx로 넘어가 실패.
+            # - read_file_handle=False(PTB 21.5+)면 메모리에 안 올리고 스트리밍.
+            # - 주의: 핸들은 send_document await가 끝날 때까지 열려 있어야 함.
+            from telegram import InputFile
+            sent = False
             try:
-                # PTB 21.5+ 방식: InputFile을 사용하여 스트리밍
-                from telegram import InputFile
-                # PTB 버전에 따라 read_file_handle 파라미터가 있을 수도 없을 수도 있음
-                try:
-                    # PTB 21.5+ - read_file_handle=False로 스트리밍
-                    input_file = InputFile(local_path, filename=local_path.name, read_file_handle=False)
-                except TypeError:
-                    # PTB 20.7 - read_file_handle 파라미터 없음, fallback to manual streaming
-                    # 수동 HTTP 스트리밍 (tools/telegram_large_file.py의 BotAPI 사용)
-                    if HAS_LARGE_INTEGRATION:
-                        logger.info(f"PTB 20.7 fallback: 수동 스트리밍으로 {local_path.name} 전송")
-                        # BotAPI 직접 사용 - 1MB 버퍼 스트리밍
+                with open(local_path, 'rb') as f:
+                    try:
+                        input_file = InputFile(f, filename=local_path.name, read_file_handle=False)
+                    except TypeError:
+                        # 구 PTB(<21.5, requirements상 도달 불가): 수동 스트리밍으로 폴백
+                        input_file = None
+                    if input_file is not None:
+                        await context.bot.send_document(
+                            chat_id=update.effective_chat.id,
+                            document=input_file,
+                            filename=local_path.name,
+                            caption=f"{local_path.name} ({format_size(file_size)})"
+                        )
+                        sent = True
+                    elif HAS_LARGE_INTEGRATION:
+                        logger.info(f"구 PTB fallback: 수동 스트리밍으로 {local_path.name} 전송")
                         loop = asyncio.get_event_loop()
                         def _manual_send():
                             token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -653,30 +776,19 @@ async def sendlarge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             from tools.telegram_large_file import BotAPI, signature
                             api = BotAPI(api_base, token)
                             sig = signature(local_path)
-                            result = api.send_document(
+                            return api.send_document(
                                 local_path, 0, file_size, local_path.name,
                                 str(update.effective_chat.id),
                                 f"{local_path.name} ({format_size(file_size)})",
                                 expected_signature=sig
                             )
-                            return result
                         await loop.run_in_executor(None, _manual_send)
-                        input_file = None  # 이미 전송됨
-                    else:
-                        # 최후 fallback: 기존 방식 (메모리 위험 있지만 어쩔 수 없음)
-                        logger.warning(f"PTB 20.7 + 대용량 모듈 없음, 메모리 로드 위험: {local_path.name}")
-                        input_file = InputFile(local_path, filename=local_path.name)
-                
-                if input_file is not None:
-                    await context.bot.send_document(
-                        chat_id=update.effective_chat.id,
-                        document=input_file,
-                        filename=local_path.name,
-                        caption=f"{local_path.name} ({format_size(file_size)})"
-                    )
+                        sent = True
             except Exception as e:
-                # fallback: 기존 방식
-                logger.warning(f"스트리밍 전송 실패, fallback: {e}")
+                logger.warning(f"스트리밍 전송 실패, fallback 시도: {e}")
+            if not sent:
+                # 최후 fallback: PTB 기본 방식 (메모리 로드 위험 - 작은 파일용)
+                logger.warning(f"fallback 전송 (메모리 로드): {local_path.name} ({format_size(file_size)})")
                 with open(local_path, 'rb') as f:
                     await context.bot.send_document(
                         chat_id=update.effective_chat.id,
@@ -1097,6 +1209,14 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception as e:
             logger.warning(f"자동 복원 체크 실패 (무시): {e}")
 
+        # ROUND-3: 업로드 성공 후 로컬 정리 (opt-in, 기본 OFF)
+        # 분할 파일은 cleanup에서 자동 보존되므로 /merge에 영향 없음
+        try:
+            cleanup_local_paths([local_path])
+            purge_old_downloads()
+        except Exception as e:
+            logger.warning(f"정리 중 오류 (무시): {e}")
+
     except Exception as e:
         logger.exception(f"Telegram media handling failed: {e}")
         error_str = str(e)
@@ -1239,12 +1359,14 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
         if not local_path or not Path(local_path).exists():
             raise Exception("다운로드된 파일을 찾을 수 없습니다")
 
-        # 파일 크기 검사 (config.yaml)
+        # 파일 크기 검사 (config.yaml) - 출처별 상한 적용
         total_size = 0
         files_for_size = get_files_recursive(Path(local_path))
         for fp in files_for_size:
             total_size += fp.stat().st_size
-        ok, msg = _check_file_size_allowed(total_size)
+        ok, msg = _check_file_size_allowed(
+            total_size, source="http" if task.type == "http" else "download"
+        )
         if not ok:
             raise Exception(msg)
 
@@ -1326,6 +1448,13 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
             parse_mode=ParseMode.MARKDOWN,
             disable_web_page_preview=True
         )
+
+        # ROUND-3: 업로드 성공 후 로컬 정리 (opt-in, 기본 OFF)
+        try:
+            cleanup_local_paths([local_path])
+            purge_old_downloads()
+        except Exception as e:
+            logger.warning(f"정리 중 오류 (무시): {e}")
 
     except Exception as e:
         logger.exception(f"Task {task.id} failed: {e}")

@@ -1,3 +1,6 @@
+import asyncio
+import ssl
+
 import aiohttp
 import aiofiles
 import os
@@ -158,7 +161,7 @@ def _safe_filename(filename: str, download_dir: Path) -> Path:
     # 중복 방지
     counter = 1
     original_filepath = filepath
-    while filepath.exists():
+    while filepath.exists() or filepath.with_name(filepath.name + ".part").exists():
         stem = original_filepath.stem
         suffix = original_filepath.suffix
         filepath = download_dir / f"{stem}_{counter}{suffix}"
@@ -201,95 +204,158 @@ class HttpDownloader:
         #   서버로 향하는 HTTP 요청이 이미 전송된 뒤라 blind-SSRF 가능.
         # - 수정: allow_redirects=False + 매 hop마다 요청 *전* 검증.
         timeout = aiohttp.ClientTimeout(connect=30, sock_connect=30, sock_read=300)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            current_url = url
-            resp_ctx = None
-            resp = None
-            try:
-                for _hop in range(6):
-                    ok, reason = _is_safe_url(current_url)
+        filepath = part_path = None
+        expected_total = None
+        validator = None
+        max_attempts = 5
+        retryable = (
+            aiohttp.ClientPayloadError, aiohttp.ClientConnectionError,
+            aiohttp.ClientOSError, asyncio.TimeoutError, ssl.SSLError,
+        )
+        # Range offsets describe wire bytes; never transparently decompress them.
+        async with aiohttp.ClientSession(timeout=timeout, auto_decompress=False) as session:
+            for attempt in range(max_attempts):
+                offset = part_path.stat().st_size if part_path is not None else 0
+                headers = {'Accept-Encoding': 'identity'}
+                if offset:
+                    headers['Range'] = f'bytes={offset}-'
+                    if validator:
+                        headers['If-Range'] = validator
+                current_url = url
+                resp_ctx = None
+                resp = None
+                retry_error = None
+                try:
+                    # Start from the original URL on every attempt and check every
+                    # redirect BEFORE sending a request, including resumed requests.
+                    for hop in range(6):
+                        ok, reason = _is_safe_url(current_url)
+                        if not ok:
+                            raise Exception(f"⛔ 차단된 URL (SSRF 방어): {reason} ({current_url[:100]})")
+                        ctx = session.get(current_url, headers=headers, allow_redirects=False)
+                        resp = await ctx.__aenter__()
+                        resp_ctx = ctx
+                        if resp.status in (301, 302, 303, 307, 308) and resp.headers.get('Location'):
+                            next_url = urljoin(current_url, resp.headers['Location'])
+                            await resp_ctx.__aexit__(None, None, None)
+                            resp_ctx, resp = None, None
+                            if hop == 5:
+                                raise Exception("⛔ 리다이렉트 횟수 초과 (6 hops)")
+                            current_url = next_url
+                            continue
+                        break
+                    if resp is None:
+                        raise Exception("⛔ 응답 없음 (리다이렉트 처리 실패)")
+                    ok, reason = _is_safe_url(str(resp.url))
                     if not ok:
-                        raise Exception(f"⛔ 차단된 URL (SSRF 방어): {reason} ({current_url[:100]})")
-                    resp_ctx = session.get(current_url, allow_redirects=False)
-                    resp = await resp_ctx.__aenter__()
-                    if resp.status in (301, 302, 303, 307, 308) and resp.headers.get('Location'):
-                        next_url = urljoin(current_url, resp.headers['Location'])
-                        await resp_ctx.__aexit__(None, None, None)
-                        resp_ctx, resp = None, None
-                        if _hop == 5:
-                            raise Exception("⛔ 리다이렉트 횟수 초과 (6 hops)")
-                        logger.info(f"↪️ 리다이렉트 hop {_hop+1}: {current_url[:80]} -> {next_url[:80]}")
-                        current_url = next_url
-                        continue
-                    break
-                if resp is None:
-                    raise Exception("⛔ 응답 없음 (리다이렉트 처리 실패)")
+                        raise Exception(f"⛔ 리다이렉트된 URL 차단 (SSRF): {reason}")
+                    if resp.status not in (200, 206):
+                        raise Exception(f"HTTP {resp.status} for {url}")
+                    if resp.headers.get('Content-Encoding', 'identity').lower() != 'identity':
+                        raise ValueError("Encoded HTTP response cannot be safely resumed")
 
-                final_url = str(resp.url)
-                if final_url != url:
-                    # 방어 심화: 최종 URL 재확인
-                    ok, reason = _is_safe_url(final_url)
-                    if not ok:
-                        raise Exception(f"⛔ 리다이렉트된 URL 차단 (SSRF): {final_url} - {reason}")
-
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status} for {url}")
-                
-                # Content-Length로 사전 크기 검사 (디스크 고갈 방지)
-                content_length = resp.headers.get('Content-Length')
-                if content_length:
-                    try:
-                        total = int(content_length)
-                        if effective_max and total > effective_max:
-                            raise Exception(f"파일 크기 {total} bytes가 최대 허용 {effective_max} bytes를 초과합니다 (Content-Length 사전 검사)")
-                    except ValueError:
-                        pass
-                    total = int(content_length) if content_length.isdigit() else 0
-                else:
-                    total = 0
-                
-                # 파일명 추출 - 안전한 방식으로
-                if not filename or filename == "file":
-                    cd = resp.headers.get('Content-Disposition', '')
-                    if 'filename=' in cd:
-                        # filename="..." 또는 filename=... 파싱
-                        match = re.search(r'filename\*?=(?:UTF-8\'\')?\"?([^\";]+)\"?', cd, re.IGNORECASE)
-                        if match:
-                            filename = match.group(1).strip('\"\' ')
-                        else:
-                            # fallback
-                            filename = cd.split('filename=')[1].strip('\"\' ').split(';')[0]
+                    length = resp.headers.get('Content-Length')
+                    if length is not None and not re.fullmatch(r'[0-9]+', length):
+                        raise ValueError("Invalid Content-Length")
+                    response_length = int(length) if length is not None else None
+                    etag = resp.headers.get('ETag')
+                    response_validator = (
+                        etag if etag and not etag.startswith('W/')
+                        else resp.headers.get('Last-Modified')
+                    )
+                    if resp.status == 206:
+                        match = re.fullmatch(r'bytes ([0-9]+)-([0-9]+)/([0-9]+)',
+                                             resp.headers.get('Content-Range', ''))
+                        if not match:
+                            raise ValueError("Invalid or unknown Content-Range")
+                        start, end, total = map(int, match.groups())
+                        if start != offset or end < start or end >= total:
+                            raise ValueError("Content-Range does not match requested offset")
+                        if response_length is not None and response_length != end - start + 1:
+                            raise ValueError("Content-Length disagrees with Content-Range")
+                        response_length = end - start + 1
+                        if expected_total is not None and total != expected_total:
+                            raise ValueError("Resource size changed during resume")
+                        if validator and response_validator and validator != response_validator:
+                            raise ValueError("Resource validator changed during resume")
+                        expected_total = total
+                        if not offset:
+                            validator = response_validator
                     else:
-                        filename = unquote(url.split('/')[-1].split('?')[0]) or "downloaded_file"
-                
-                filepath = _safe_filename(filename, self.download_dir)
+                        # A server may ignore Range, or If-Range may detect a new
+                        # resource. Never append a full 200 response to old bytes.
+                        offset = 0
+                        expected_total = response_length
+                        validator = response_validator
+                    total = expected_total or 0
+                    if effective_max and total > effective_max:
+                        raise Exception(f"파일 크기 {total} bytes가 최대 허용 {effective_max} bytes를 초과합니다 (Content-Length 사전 검사)")
 
-                downloaded = 0
-                async with aiofiles.open(filepath, 'wb') as f:
-                    async for chunk in resp.content.iter_chunked(1*1024*1024):  # 1MB chunks
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        
-                        # 다운로드 중 크기 제한 검사 (Content-Length 없는 경우 대비)
-                        if effective_max and downloaded > effective_max:
-                            await f.close()
-                            filepath.unlink(missing_ok=True)
-                            raise Exception(f"다운로드 중 크기 초과: {downloaded} > {effective_max} bytes - 중단됨")
-                        
-                        if progress_callback:
+                    if filepath is None:
+                        # 파일명 추출 - 안전한 방식으로
+                        if not filename or filename == "file":
+                            cd = resp.headers.get('Content-Disposition', '')
+                            if 'filename=' in cd:
+                                # filename="..." 또는 filename=... 파싱
+                                match = re.search(r'filename\*?=(?:UTF-8\'\')?\"?([^\";]+)\"?', cd, re.IGNORECASE)
+                                if match:
+                                    filename = match.group(1).strip('\"\' ')
+                                else:
+                                    # fallback
+                                    filename = cd.split('filename=')[1].strip('\"\' ').split(';')[0]
+                            else:
+                                filename = unquote(url.split('/')[-1].split('?')[0]) or "downloaded_file"
+                        # Exclusive creation also reserves the name for concurrent
+                        # downloads. Keep this one path throughout all retries.
+                        while True:
+                            filepath = _safe_filename(filename, self.download_dir)
+                            part_path = filepath.with_name(filepath.name + '.part')
                             try:
-                                # progress_callback이 async일 수도 sync일 수도 있음
-                                result = progress_callback(downloaded, total or downloaded)
-                                if hasattr(result, '__await__'):
-                                    await result
-                            except Exception as e:
-                                logger.debug(f"Progress callback failed: {e}")
-                
-                logger.info(f"HTTP downloaded: {filepath} ({downloaded} bytes)")
-                return filepath
-            finally:
-                if resp_ctx is not None:
-                    try:
-                        await resp_ctx.__aexit__(None, None, None)
-                    except Exception:
-                        pass
+                                with part_path.open('xb'):
+                                    pass
+                                break
+                            except FileExistsError:
+                                continue
+
+                    downloaded = offset
+                    async with aiofiles.open(part_path, 'ab' if offset else 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(1 * 1024 * 1024):
+                            await f.write(chunk)
+                            downloaded += len(chunk)
+                            if effective_max and downloaded > effective_max:
+                                await f.close()
+                                part_path.unlink(missing_ok=True)
+                                raise Exception(f"다운로드 중 크기 초과: {downloaded} > {effective_max} bytes - 중단됨")
+                            if response_length is not None and downloaded - offset > response_length:
+                                raise ValueError("HTTP body exceeds declared size")
+                            if progress_callback:
+                                try:
+                                    result = progress_callback(downloaded, total or downloaded)
+                                    if hasattr(result, '__await__'):
+                                        await result
+                                except Exception as e:
+                                    logger.debug(f"Progress callback failed: {e}")
+                    actual_size = part_path.stat().st_size
+                    if response_length is not None and actual_size - offset != response_length:
+                        raise aiohttp.ClientPayloadError("Incomplete HTTP response body")
+                    if expected_total is not None and actual_size != expected_total:
+                        raise aiohttp.ClientPayloadError("Incomplete HTTP download")
+                    # Same directory/filesystem: only publish a complete file.
+                    part_path.replace(filepath)
+                    logger.info(f"HTTP downloaded: {filepath} ({actual_size} bytes)")
+                    return filepath
+                except retryable as exc:
+                    if attempt == max_attempts - 1:
+                        raise
+                    retry_error = exc
+                finally:
+                    if resp_ctx is not None:
+                        try:
+                            await resp_ctx.__aexit__(None, None, None)
+                        except Exception:
+                            pass
+                if retry_error is not None:
+                    delay = min(2 ** attempt, 30)
+                    logger.warning("HTTP download interrupted (%s); retry %d/%d in %ss",
+                                   type(retry_error).__name__, attempt + 1, max_attempts - 1, delay)
+                    await asyncio.sleep(delay)

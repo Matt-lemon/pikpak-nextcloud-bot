@@ -3,6 +3,7 @@
 실행: python -m pytest tests/ -q
 """
 import sys
+import importlib
 import types
 from pathlib import Path
 
@@ -14,7 +15,10 @@ if str(ROOT) not in sys.path:
 # --- 서드파티 스텁 (import 시점에만 필요) ---
 for _name in ("aiohttp", "aiofiles", "yt_dlp"):
     if _name not in sys.modules:
-        sys.modules[_name] = types.ModuleType(_name)
+        try:
+            importlib.import_module(_name)
+        except ImportError:
+            sys.modules[_name] = types.ModuleType(_name)
 
 if "humanize" not in sys.modules:
     _h = types.ModuleType("humanize")

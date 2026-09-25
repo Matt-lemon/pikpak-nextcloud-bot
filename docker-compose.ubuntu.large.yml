@@ -64,12 +64,14 @@ services:
       - ./downloads:/downloads
       - ./logs:/app/logs
       - ./data:/app/data  # 빈 폴더 자동 정리 on/off 상태 (텔레그램 /cleanup_on·/cleanup_off)
-      - ./bot-api-data:/var/lib/telegram-bot-api:ro  # 로컬 Bot API 다운로드 폴더 공유 (다운로드는 제한 없음)
+      - ./bot-api-data:/var/lib/telegram-bot-api:rw  # 복사 검증 후 Bot API 원본 삭제를 위해 쓰기 가능
       - ./config.yaml:/app/config.yaml:ro  # SECURITY FIX: Mount config.yaml
       - /etc/localtime:/etc/localtime:ro
     environment:
       - ARIA2_HOST=http://aria2:6800
       - TELEGRAM_BOT_API_URL=http://telegram-bot-api:8081  # 로컬 API - 다운로드 무제한, 업로드 2,000MB
+      - TELEGRAM_BOT_API_STORAGE_ROOT=/var/lib/telegram-bot-api
+      - TELEGRAM_CLEANUP_SOURCE_AFTER_COPY=true  # /downloads 복사 검증 후 NVMe Bot API 원본 삭제
       - TZ=Asia/Seoul
     networks:
       - pikpak-net

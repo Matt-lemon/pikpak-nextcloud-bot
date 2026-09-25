@@ -87,6 +87,12 @@ du -sh downloads/
 docker system df
 ```
 
+## 로컬 Bot API NVMe 정리
+
+대용량 구성(`docker-compose.ubuntu.large.yml`)에서는 Bot API 공유 볼륨을 읽기/쓰기(`:rw`)로 마운트합니다. Telegram 원본을 `/downloads`로 복사한 뒤 fsync 및 크기 검증이 성공하면 원본을 즉시 삭제해 `bot-api-data`가 계속 불어나지 않게 합니다.
+
+필요하면 `.env`/compose에서 `TELEGRAM_CLEANUP_SOURCE_AFTER_COPY=false`로 원본 삭제를 끌 수 있습니다. `/downloads`의 staging 파일까지 Nextcloud 업로드 후 지우려면 기존 `CLEANUP_AFTER_UPLOAD=true`도 켜세요.
+
 ## 파일 위치
 
 - 다운로드 임시: `~/pikpak-nextcloud-bot/downloads/`

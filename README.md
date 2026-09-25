@@ -10,6 +10,7 @@
 ```
 📁 로컬 Bot API 파일 직접 복사: /var/lib/telegram-bot-api/.../file_1.mp4 -> /downloads/video.mp4 (3,459,737,747 bytes)
 ✅ 로컬 파일 직접 복사 완료
+🧹 로컬 Bot API 원본 삭제 완료 (대용량 compose 기본 활성)
 ✅ Chunked upload v2 completed: PikPakBot/2026-09-10/forwarded/video.mp4 (3459737747 bytes, 338 chunks)
 ✅ 완료! [전달됨] - Nextcloud 공유 링크 생성
 ```
@@ -114,12 +115,21 @@ https://example.com/large_video.mp4
 
 ### 공식 문서 준수 수정 사항 (2026-09-10)
 
-1. **Docker**: `bot`에 `./bot-api-data:/var/lib/telegram-bot-api:ro` 공유 - 로컬 파일 직접 읽기
+1. **Docker**: `bot`에 `./bot-api-data:/var/lib/telegram-bot-api:rw` 공유 - 로컬 파일 직접 읽고, 검증된 staging 복사 후 원본 정리
 2. **Bot 초기화**: `read_timeout=7200`초로 증가 - 대용량 다운로드 준비 시간 확보
 3. **에러 안내**: 다운로드 무제한 / 업로드 2,000MB로 정확히 구분
 4. **Nextcloud v2**: `Destination` 헤더, `00001` 형식 청크 이름, `/.file` MOVE로 수정
 
 참고: https://docs.nextcloud.com/server/latest/developer_manual/client_apis/WebDAV/chunking.html
+
+## 🧹 로컬 Bot API NVMe 임시파일 정리
+
+`docker-compose.ubuntu.large.yml`은 Telegram Local Bot API가 내려받은 원본을 `/downloads`에 복사한 뒤 **fsync + 크기 검증이 끝난 경우에만** 공유 저장소의 원본을 삭제합니다.
+
+- `TELEGRAM_CLEANUP_SOURCE_AFTER_COPY=true` — 원본 정리 활성화
+- `TELEGRAM_BOT_API_STORAGE_ROOT=/var/lib/telegram-bot-api` — 삭제 허용 루트
+- 허용 루트 밖 파일과 심볼릭 링크는 삭제하지 않음
+- `/downloads` staging 파일의 Nextcloud 업로드 후 삭제는 기존 `CLEANUP_AFTER_UPLOAD=true` 옵션이 별도로 담당
 
 ## 📁 프로젝트 구조
 

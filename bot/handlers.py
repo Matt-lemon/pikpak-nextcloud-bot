@@ -13,6 +13,11 @@ from .nextcloud import NextcloudClient
 from .queue_manager import QueueManager, DownloadTask
 from .utils import format_size, format_speed, progress_bar, get_files_recursive, sanitize_filename, safe_join, truncate_lines
 from .utils.file_splitter import CHUNK_SIZE as SPLIT_CHUNK_SIZE
+from .utils.local_files import (
+    cleanup_local_bot_api_source,
+    copy_local_bot_api_file,
+    find_local_bot_api_file,
+)
 
 # 대용량 파일 분할 전송 통합 (선택적)
 try:
@@ -1204,28 +1209,34 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
                 local_path = safe_join(download_dir, f"{media_type}_{uuid.uuid4().hex[:8]}{suffix}")
                 break
         
-        bot_api_file_path = None
-        if hasattr(tg_file, 'file_path') and tg_file.file_path:
-            possible_paths = [
-                Path(f"/var/lib/telegram-bot-api/{tg_file.file_path}"),
-                Path(f"/var/lib/telegram-bot-api/documents/{Path(tg_file.file_path).name}"),
-                Path(tg_file.file_path) if Path(tg_file.file_path).is_absolute() else None
-            ]
-            for p in possible_paths:
-                if p and p.exists():
-                    bot_api_file_path = p
-                    logger.info(f"📁 로컬 Bot API 파일 직접 복사: {p} -> {local_path}")
-                    break
-        
-        if bot_api_file_path and bot_api_file_path.exists():
-            import shutil
-            with open(bot_api_file_path, 'rb') as src, open(local_path, 'wb') as dst:
-                while True:
-                    chunk = src.read(8*1024*1024)
-                    if not chunk:
-                        break
-                    dst.write(chunk)
-            logger.info(f"✅ 로컬 파일 직접 복사 완료: {local_path} ({local_path.stat().st_size} bytes)")
+        # 로컬 Bot API 공유 볼륨을 쓸 수 있으면 네트워크 재다운로드 없이
+        # 바로 staging 한다. 허용 루트 밖의 절대경로/심볼릭링크는 거부한다.
+        bot_api_file_path = find_local_bot_api_file(
+            getattr(tg_file, "file_path", None)
+        )
+
+        if bot_api_file_path is not None:
+            logger.info(
+                f"📁 로컬 Bot API 파일 직접 복사: "
+                f"{bot_api_file_path} -> {local_path}"
+            )
+            copied_size = copy_local_bot_api_file(
+                bot_api_file_path,
+                local_path,
+            )
+            logger.info(
+                f"✅ 로컬 파일 직접 복사 완료: "
+                f"{local_path} ({copied_size} bytes)"
+            )
+
+            # 복사가 fsync + 크기 검증까지 성공한 뒤에만 원본을 지운다.
+            # 대용량 compose에서는 이 옵션을 기본 활성화해 NVMe 임시 저장소가
+            # Telegram 원본 캐시로 계속 불어나지 않게 한다.
+            if cleanup_local_bot_api_source(bot_api_file_path):
+                logger.info(
+                    f"🧹 로컬 Bot API 원본 삭제 완료: "
+                    f"{bot_api_file_path}"
+                )
         else:
             await tg_file.download_to_drive(custom_path=str(local_path))
         

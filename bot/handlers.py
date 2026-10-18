@@ -9,6 +9,9 @@ from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
 from .downloaders import LinkDetector, HttpDownloader, TorrentDownloader, YtDlpDownloader
+from .downloaders.hf_downloader import HFDownloader
+from .downloaders.hf_resolver import HFError, is_hf_url, parse_hf_url, expand_shards, public_error
+from .hf_state import HFTaskStore
 from .nextcloud import NextcloudClient
 from .queue_manager import QueueManager, DownloadTask
 from .utils import format_size, format_speed, progress_bar, get_files_recursive, sanitize_filename, safe_join, truncate_lines
@@ -33,6 +36,8 @@ queue_manager = None
 nc_client = None
 downloaders = {}
 CONFIG = {}  # config.yaml 내용 저장
+hf_store = None
+hf_state_unavailable = False
 
 def _parse_size_to_bytes(size_str) -> int:
     """20GB, 500MB 같은 문자열을 bytes로 변환"""
@@ -62,7 +67,7 @@ def init_managers(config):
     - nextcloud.create_share_link: 공유 링크 생성 여부
     - notifications.send_progress_every: 진행률 업데이트 주기
     """
-    global queue_manager, nc_client, downloaders, CONFIG
+    global queue_manager, nc_client, downloaders, CONFIG, hf_store, hf_state_unavailable
     CONFIG = config or {}
     
     bot_cfg = CONFIG.get('bot', {})
@@ -154,6 +159,39 @@ def init_managers(config):
         logger.info(f"✅ yt-dlp downloader enabled (format: {ytdlp_format or 'default'}, max: {ytdlp_cfg.get('max_size', 'global')})")
     else:
         logger.info("⏭️ yt-dlp downloader disabled by config.yaml")
+
+    # HF is isolated from both existing HTTP and torrent download behavior.
+    if 'http' in downloaders:
+        try:
+            hf_store = HFTaskStore()
+            hf_state_unavailable = False
+            hf_max = min(CONFIG.get('_http_max_bytes') or max_file_bytes, max_file_bytes)
+            hf_limit = os.getenv('HF_MAX_FILE_SIZE_GB', '').strip()
+            if hf_limit:
+                import math
+                try:
+                    value = float(hf_limit)
+                    if not math.isfinite(value) or value <= 0:
+                        raise ValueError()
+                    hf_max = int(value * 1024**3)
+                except (ValueError, OverflowError):
+                    raise HFError('config', 'HF_MAX_FILE_SIZE_GB는 0보다 큰 용량(GB)으로 설정하세요.') from None
+            CONFIG['_hf_max_bytes'] = hf_max
+            hf_aria2_host = os.getenv('HF_ARIA2_HOST')
+            aria_api = (TorrentDownloader(
+                download_dir, hf_aria2_host, os.getenv('ARIA2_SECRET', '')
+            ) if hf_aria2_host else (downloaders.get('torrent') or TorrentDownloader(
+                download_dir, os.getenv('ARIA2_HOST', 'http://aria2:6800'),
+                os.getenv('ARIA2_SECRET', ''),
+            ))).client
+            downloaders['hf'] = HFDownloader(
+                download_dir, aria_api, hf_store,
+                max_file_size=hf_max,
+            )
+        except HFError as error:
+            hf_store = None
+            hf_state_unavailable = True
+            logger.error('HF initialization failed: %s', error.code)
     
     # --- notifications 설정 ---
     progress_every = notifications_cfg.get('send_progress_every', 5)
@@ -312,15 +350,22 @@ def purge_old_downloads() -> int:
     max_days = _cleanup_max_age_days()
     if max_days <= 0:
         return 0
+    if hf_state_unavailable:
+        # A damaged journal must not expose untracked HF partials to age cleanup.
+        logger.warning('Age cleanup skipped until HF journal is readable')
+        return 0
     import time
     download_root = Path(os.getenv("DOWNLOAD_DIR", "/downloads"))
     if not download_root.is_dir():
         return 0
     cutoff = time.time() - max_days * 86400
+    protected = hf_store.protected_paths() if hf_store else set()
     removed = 0
     try:
         for q in download_root.rglob('*'):
             try:
+                if any(p == q.resolve() or p in q.resolve().parents for p in protected):
+                    continue
                 if q.is_symlink():
                     continue
                 if q.is_file() and q.stat().st_mtime < cutoff:
@@ -349,6 +394,11 @@ def _check_file_size_allowed(file_size: int, source: str = "telegram") -> tuple[
     """
     if file_size is None:
         return True, ""
+    if source == 'hf':
+        hf_max = CONFIG.get('_hf_max_bytes', CONFIG.get('_max_file_bytes', 20 * 1024**3))
+        if file_size > hf_max:
+            return False, f"파일 크기 {format_size(file_size)}가 HF 최대 {format_size(hf_max)}를 초과합니다. HF_MAX_FILE_SIZE_GB를 확인하세요."
+        return True, ''
     if source == "http":
         http_max = CONFIG.get('_http_max_bytes')
         if http_max and file_size > http_max:
@@ -366,6 +416,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     max_gb = CONFIG.get('bot', {}).get('max_file_size_gb', 20)
     share_enabled = CONFIG.get('_create_share_link', True)
+    hf_limit_info = (f"• HF 최대 파일: {CONFIG['_hf_max_bytes'] / 1024**3:g}GiB\n"
+                     if 'hf' in downloaders and '_hf_max_bytes' in CONFIG else '')
     text = f"""
 🚀 **PikPak Clone Bot - Nextcloud 연동**
 
@@ -383,6 +435,7 @@ PikPak처럼 링크만 보내면 Nextcloud에 자동 저장!
 /start - 이 메시지
 /help - 도움말
 /status - 큐 상태 확인
+/cancel <작업ID> - HF 다운로드 취소 (부분 파일 보존)
 /list - Nextcloud 파일 목록
 /cleanup - Nextcloud 빈 폴더 정리 (즉시 수동 실행)
 /cleanup_on - 빈 폴더 자동 정리 켜기 (매일 새벽 자동 실행)
@@ -390,9 +443,9 @@ PikPak처럼 링크만 보내면 Nextcloud에 자동 저장!
 /merge - 분할된 파일 자동 복원
 /sendlarge <경로> - Nextcloud의 대용량 파일을 텔레그램으로 분할 전송
 
-**설정 (config.yaml):**
-• 최대 파일: {max_gb}GB
-• 공유 링크: {'활성' if share_enabled else '비활성'}
+**설정:**
+• 최대 일반 파일: {max_gb}GB
+{hf_limit_info}• 공유 링크: {'활성' if share_enabled else '비활성'}
 • 동시 다운로드: {os.getenv('MAX_CONCURRENT_DOWNLOADS', 3)}개
 
 **사용법:**
@@ -415,8 +468,30 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     text = queue_manager.get_status_text()
     # config 정보 추가
-    text += f"\n\n⚙️ 설정: 최대 {CONFIG.get('bot', {}).get('max_file_size_gb', 20)}GB, 공유링크 {'ON' if CONFIG.get('_create_share_link', True) else 'OFF'}"
+    text += f"\n\n⚙️ 설정: 일반 파일 최대 {CONFIG.get('bot', {}).get('max_file_size_gb', 20)}GB, 공유링크 {'ON' if CONFIG.get('_create_share_link', True) else 'OFF'}"
+    if 'hf' in downloaders and '_hf_max_bytes' in CONFIG:
+        text += f"\nHF 최대 파일: {CONFIG['_hf_max_bytes'] / 1024**3:g}GiB"
     await update.message.reply_text(text)
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Explicit HF cancellation; shutdown cancellation remains recoverable."""
+    if not check_permission(update.effective_user.id):
+        await update.message.reply_text('⛔ 권한이 없습니다.')
+        return
+    args = context.args or []
+    if len(args) != 1:
+        await update.message.reply_text('HF 작업 취소: /cancel 작업ID (부분 파일은 보존합니다.)')
+        return
+    task = next((t for t in list(queue_manager.queue) + list(queue_manager.active.values())
+                 if t.id == args[0] and t.type == 'hf' and t.chat_id == update.effective_chat.id), None)
+    if task is None or task.status not in ('queued', 'downloading'):
+        await update.message.reply_text('이 대화에서 대기·다운로드 중인 HF 작업을 찾지 못했습니다. 업로드 중인 작업은 취소할 수 없습니다.')
+        return
+    try:
+        await downloaders['hf'].cancel(task)
+        await update.message.reply_text('HF 작업을 취소했습니다. 부분 파일과 .aria2는 보존하며 재시작해도 자동 재개하지 않습니다.')
+    except HFError:
+        await update.message.reply_text('HF 취소 요청은 기록했습니다. aria2에 연결할 수 없어 전송 중단을 아직 확인하지 못했습니다. 서비스 상태를 확인하세요.')
 
 async def list_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Nextcloud 폴더 목록 - /list [하위경로] (base_path 내부만 허용).
@@ -1020,6 +1095,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if urls:
             # 다운로드 타입 비활성화 체크
             for url in urls[:5]:
+                if is_hf_url(url):
+                    await process_single_link(url, update, context)
+                    continue
                 detected = LinkDetector.detect(url)
                 dtype = detected['type']
                 # config에서 비활성화된 타입이면 스킵
@@ -1378,7 +1456,43 @@ async def handle_telegram_media(update: Update, context: ContextTypes.DEFAULT_TY
             except:
                 await update.message.reply_text(f"❌ 파일 처리 실패: {e}")
 
-async def process_single_link(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE, detected=None):
+async def process_single_link(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE, detected=None, hf_metadata=None):
+    if is_hf_url(url):
+        if 'hf' not in downloaders or hf_store is None:
+            await update.message.reply_text('⏭️ HF 다운로드를 사용할 수 없습니다. HTTP 활성화 설정과 HF 상태 파일을 확인하세요.')
+            return
+        try:
+            source = parse_hf_url(url)
+            if source.filename is None:
+                raise HFError('repo_selection', '이번 버전은 HF 파일 URL을 지원합니다. 원하는 .gguf의 resolve/blob 링크를 보내주세요. 저장소 목록·inline quant 선택은 TODO입니다.')
+            if hf_metadata is None:
+                sources = expand_shards(source)
+                prepared = []
+                commit = None
+                from dataclasses import replace
+                # Resolve every member before queueing any shard. A missing or
+                # inaccessible sibling must not silently produce an incomplete GGUF.
+                for member in sources:
+                    resolved = await downloaders['hf'].resolver.resolve(
+                        replace(member, revision=commit) if commit else member
+                    )
+                    commit = resolved.commit or commit
+                    maximum = downloaders['hf'].max_file_size
+                    if maximum and resolved.size is not None and resolved.size > maximum:
+                        raise HFError('size', 'HF 파일이 설정된 최대 다운로드 크기를 초과합니다.')
+                    metadata = member.metadata()
+                    metadata.update(commit=commit, size=resolved.size, etag=resolved.etag, refreshes=0)
+                    prepared.append((member, metadata))
+                downloaders['hf'].ensure_space(sum(metadata.get('size') or 0 for _, metadata in prepared))
+                for member, metadata in prepared:
+                    await process_single_link(member.original_url, update, context, hf_metadata=metadata)
+                return
+            url = source.original_url
+            detected = {'type': 'hf', 'url': url, 'name': Path(source.filename).name}
+        except HFError as error:
+            logger.warning('HF link rejected: %s', error.code)
+            await update.message.reply_text('❌ ' + public_error(error))
+            return
     if not detected:
         detected = LinkDetector.detect(url)
     
@@ -1417,6 +1531,13 @@ async def process_single_link(url: str, update: Update, context: ContextTypes.DE
         chat_id=update.effective_chat.id,
         message_id=status_msg.message_id
     )
+    if task.type == 'hf':
+        task.hf = hf_metadata
+        try:
+            hf_store.save(task)
+        except HFError as error:
+            await update.message.reply_text('❌ ' + public_error(error))
+            return
     queue_manager.add(task)
     
     async def _run_limited():
@@ -1427,6 +1548,9 @@ async def process_single_link(url: str, update: Update, context: ContextTypes.DE
 async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAULT_TYPE, detected: dict):
     """실제 다운로드 + Nextcloud 업로드 (PikPak 핵심 로직)"""
     try:
+        if task.type == 'hf' and task.status == 'cancelled':
+            return
+        recover_hf_upload = task.type == 'hf' and task.status == 'uploading'
         task.status = "downloading"
         
         last_progress = 0
@@ -1458,7 +1582,12 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
 
         # 1. 다운로드
         local_path = None
-        if task.type in ['magnet', 'torrent_url', 'torrent_file']:
+        if task.type == 'hf':
+            if recover_hf_upload:
+                local_path = downloaders['hf'].completed_path(task)
+            else:
+                local_path = await downloaders['hf'].download(task, progress_callback=update_progress)
+        elif task.type in ['magnet', 'torrent_url', 'torrent_file']:
             local_path = await downloaders['torrent'].download(
                 task.url, 
                 progress_callback=lambda c,t,s=0,st="": asyncio.create_task(update_progress(c,t,s,st))
@@ -1487,7 +1616,7 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
         for fp in files_for_size:
             total_size += fp.stat().st_size
         ok, msg = _check_file_size_allowed(
-            total_size, source="http" if task.type == "http" else "download"
+            total_size, source=task.type if task.type in ("http", "hf") else "download"
         )
         if not ok:
             raise Exception(msg)
@@ -1558,6 +1687,8 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
 
         # 3. 완료 메시지
         task.status = "completed"
+        if task.type == 'hf':
+            hf_store.save(task)
         result_text = f"✅ **완료!**\nID: `{task.id}`\n타입: `{task.type}`\n\n**Nextcloud 저장 위치:**\n`{_code(base_remote)}`\n\n"
         for remote_path, share_url, size in uploaded_links[:5]:
             # ROUND-5 FIX: 파일명도 백틱 처리 (이름 속 _ * 등이 Markdown 파괴 방지)
@@ -1580,16 +1711,41 @@ async def process_download_task(task: DownloadTask, context: ContextTypes.DEFAUL
             logger.warning(f"정리 중 오류 (무시): {e}")
 
     except Exception as e:
-        logger.exception(f"Task {task.id} failed: {e}")
-        task.status = "failed"
-        task.error = str(e)
+        if task.type == 'hf':
+            logger.error('HF task failed: id=%s code=%s', task.id, getattr(e, 'code', 'internal'))
+            error_text = public_error(e)
+        else:
+            logger.exception(f"Task {task.id} failed: {e}")
+            error_text = str(e)
+        task.status = 'cancelled' if task.type == 'hf' and (task.status == 'cancelled' or getattr(e, 'code', None) == 'cancelled') else "failed"
+        task.error = error_text
+        if task.type == 'hf':
+            try:
+                hf_store.save(task)
+            except HFError:
+                logger.error('HF failed task state could not be saved: id=%s', task.id)
         try:
             await context.bot.edit_message_text(
                 chat_id=task.chat_id, message_id=task.message_id,
-                text=f"❌ **실패**\nID: `{task.id}`\n오류: `{_code(str(e)[:500])}`",
+                text=f"❌ **실패**\nID: `{task.id}`\n오류: `{_code(error_text[:500])}`",
                 parse_mode=ParseMode.MARKDOWN
             )
         except:
             pass
     finally:
         queue_manager.complete(task.id)
+
+
+async def restore_hf_tasks(app):
+    """Called from PTB post_init; generic in-memory tasks remain unchanged."""
+    if hf_store is None or 'hf' not in downloaders:
+        return
+    from types import SimpleNamespace
+    context = SimpleNamespace(bot=app.bot)
+    for task in hf_store.pending():
+        queue_manager.add(task)
+        detected = {'type': 'hf', 'url': task.url, 'name': Path(task.hf['filename']).name}
+        app.create_task(queue_manager.run_with_limit(
+            task, process_download_task(task, context, detected)
+        ), name=f'hf-restore-{task.id}')
+        logger.info('HF task restored from original URL: id=%s', task.id)

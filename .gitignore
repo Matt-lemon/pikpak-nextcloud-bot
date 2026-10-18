@@ -18,3 +18,11 @@ venv/
 
 # Docker
 aria2-session.txt
+
+# Telegram Local Bot API runtime storage; can contain tokens in directory names.
+bot-api-data/
+
+# Local HF auth/environment files and download cache must not be committed.
+*.token
+*.sqlite3
+*.sqlite3-*

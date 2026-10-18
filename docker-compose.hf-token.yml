@@ -1,0 +1,15 @@
+# Optional: read only HF_TOKEN from the user's existing Rio .env.
+# Add AFTER the normal compose file; do not pass this file to the aria2 service.
+# docker compose -f docker-compose.ubuntu.large.yml -f docker-compose.hf-token.yml up -d --build bot
+# A HF_TOKEN present in bot's environment (even empty) takes precedence.
+services:
+  bot:
+    environment:
+      HF_TOKEN_ENV_FILE: /run/hf-token.env
+    volumes:
+      - type: bind
+        source: /home/mir2mix/ai-assistant-project/.env
+        target: /run/hf-token.env
+        read_only: true
+        bind:
+          create_host_path: false

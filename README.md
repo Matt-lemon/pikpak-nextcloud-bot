@@ -46,6 +46,9 @@ docker compose -f docker-compose.ubuntu.yml logs -f bot
 
 Telegram에서 `/start` → 링크 또는 파일 전송 → Nextcloud에 자동 저장!
 
+Hugging Face gated/private LFS/Xet 파일 지원: [설정·resume·검증 가이드](docs/HUGGING_FACE.md).
+원본 resolve URL에서만 인증하며 HF_TOKEN을 aria2에 전달하지 않습니다.
+
 ## 📦 대용량 파일 (3.2GB+)
 
 ### 공식 문서 기준

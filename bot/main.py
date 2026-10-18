@@ -7,12 +7,12 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
 from .handlers import (
-    start_command, help_command, status_command, list_command,
+    start_command, help_command, status_command, list_command, cancel_command,
     cleanup_command, cleanup_on_command, cleanup_off_command,
     merge_command, sendlarge_command,
     handle_message, init_managers, purge_old_downloads,
     handle_video, handle_audio, handle_photo, handle_voice,
-    handle_video_note, handle_animation
+    handle_video_note, handle_animation, restore_hf_tasks
 )
 from . import cleanup_state
 
@@ -24,7 +24,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def main():
-    load_dotenv()
+    load_dotenv(override=False)  # shell environment wins, including HF_TOKEN
     
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -173,6 +173,7 @@ def main():
                 logger.exception("일일 빈 폴더 정리 실패")
 
     async def post_init(app):
+        await restore_hf_tasks(app)
         cfg = config.get("cleanup", {}) or {}
         # 자동 삭제는 opt-in: 기본값 config.cleanup.enabled(기본 False) +
         # 텔레그램 /cleanup_on·/cleanup_off 토글(상태 파일 영속). 스케줄러는 항상
@@ -210,6 +211,7 @@ def main():
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CommandHandler("list", list_command))
     app.add_handler(CommandHandler("cleanup", cleanup_command))
     app.add_handler(CommandHandler("cleanup_on", cleanup_on_command))

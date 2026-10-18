@@ -54,6 +54,8 @@ services:
   bot:
     build: .
     container_name: pikpak-bot
+    extra_hosts:
+      - "mir2mix.asuscomm.com:192.168.50.234"
     restart: unless-stopped
     depends_on:
       - aria2

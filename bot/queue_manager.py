@@ -20,6 +20,7 @@ class DownloadTask:
     progress: float = 0
     created_at: datetime = field(default_factory=datetime.now)
     completed_at: Optional[datetime] = None
+    hf: Optional[dict] = None  # canonical HF source + GID; never signed URLs/tokens
 
 class QueueManager:
     def __init__(self, max_concurrent: int = 3, max_history: int = 100):
@@ -85,7 +86,7 @@ class QueueManager:
         """작업 완료 - active에서 제거하고 history로 이동"""
         task = self.active.pop(task_id, None)
         if task:
-            if task.status not in ("completed", "failed"):
+            if task.status not in ("completed", "failed", "cancelled"):
                 task.status = "completed"
             task.completed_at = datetime.now()
             task.progress = 100 if task.status == "completed" else task.progress

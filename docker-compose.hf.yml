@@ -1,0 +1,32 @@
+# Optional HF-only daemon: preserves the existing torrent aria2 session settings.
+# Combine with the Ubuntu compose and, if needed, docker-compose.hf-token.yml.
+services:
+  aria2-hf:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["aria2c"]
+    command:
+      - --no-conf
+      - --enable-rpc=true
+      - --rpc-listen-all=true
+      - --rpc-listen-port=6800
+      - --rpc-secret=${ARIA2_SECRET:?Set ARIA2_SECRET in the bot .env}
+      - --disable-ipv6=true
+      - --dir=/downloads
+      - --file-allocation=none
+      - --quiet=true
+      - --console-log-level=error
+      - --summary-interval=0
+    volumes:
+      - ./downloads:/downloads
+    networks:
+      - pikpak-net
+    # No env_file, HF_TOKEN, published RPC port, log or save-session option.
+  bot:
+    environment:
+      HF_ARIA2_HOST: http://aria2-hf:6800
+      # Inherit from Compose's environment/.env; an absent key stays absent,
+      # allowing HF_TOKEN_ENV_FILE, while a shell value wins over .env.
+      HF_TOKEN:
+    depends_on:
+      - aria2-hf
